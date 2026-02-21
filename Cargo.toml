@@ -1,0 +1,18 @@
+[package]
+name = "boldtrax-bot"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["core", "exchanges"]
+
+[dependencies]
+boldtrax-core = { path = "./core" }
+exchanges = { path = "./exchanges" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+dotenvy = "0.15"
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

@@ -1,0 +1,26 @@
+[package]
+name = "exchanges"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+boldtrax-core = { path = "../core" }
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
+rust_decimal_macros = "1"

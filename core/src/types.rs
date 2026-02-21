@@ -1,0 +1,439 @@
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::Signed;
+use strum::{Display, EnumString};
+
+// currency we care about
+#[derive(
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumString,
+    Display,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum Currency {
+    BTC,
+    ETH,
+    XRP,
+    USDT,
+    USDC,
+    SOL,
+}
+// instrument types we care about
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum InstrumentType {
+    Spot,
+    Swap,
+}
+// exchange we care about
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum Exchange {
+    Binance,
+    Bybit,
+    Gateio,
+    Aster,
+}
+
+impl Exchange {
+    pub fn short_code(&self) -> &'static str {
+        match self {
+            Exchange::Binance => "BN",
+            Exchange::Bybit => "BY",
+            Exchange::Gateio => "GT",
+            Exchange::Aster => "AS",
+        }
+    }
+}
+
+// list of pairs we care about
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum Pairs {
+    BTCUSDT,
+    ETHUSDT,
+    XRPUSDT,
+    USDCUSDT,
+    SOLUSDT,
+}
+
+impl Pairs {
+    pub fn base(&self) -> Currency {
+        match self {
+            Pairs::BTCUSDT => Currency::BTC,
+            Pairs::ETHUSDT => Currency::ETH,
+            Pairs::XRPUSDT => Currency::XRP,
+            Pairs::USDCUSDT => Currency::USDC,
+            Pairs::SOLUSDT => Currency::SOL,
+        }
+    }
+
+    pub fn quote(&self) -> Currency {
+        match self {
+            Pairs::BTCUSDT => Currency::USDT,
+            Pairs::ETHUSDT => Currency::USDT,
+            Pairs::XRPUSDT => Currency::USDT,
+            Pairs::USDCUSDT => Currency::USDT,
+            Pairs::SOLUSDT => Currency::USDT,
+        }
+    }
+
+    pub fn from_currencies(base: Currency, quote: Currency) -> Option<Self> {
+        match (base, quote) {
+            (Currency::BTC, Currency::USDT) => Some(Pairs::BTCUSDT),
+            (Currency::ETH, Currency::USDT) => Some(Pairs::ETHUSDT),
+            (Currency::XRP, Currency::USDT) => Some(Pairs::XRPUSDT),
+            (Currency::USDC, Currency::USDT) => Some(Pairs::USDCUSDT),
+            (Currency::SOL, Currency::USDT) => Some(Pairs::SOLUSDT),
+            _ => None,
+        }
+    }
+}
+
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum FundingInterval {
+    EveryHour,
+    Every4Hours,
+    Every8Hours,
+    CustomSeconds(u32),
+}
+
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+pub struct InstrumentKey {
+    pub exchange: Exchange,
+    pub pair: Pairs,
+    pub instrument_type: InstrumentType,
+}
+
+impl Default for InstrumentKey {
+    fn default() -> Self {
+        Self {
+            exchange: Exchange::Binance,
+            pair: Pairs::BTCUSDT,
+            instrument_type: InstrumentType::Spot,
+        }
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct Instrument {
+    pub key: InstrumentKey,
+    pub exchange_symbol: String,
+    pub tick_size: Decimal,
+    pub lot_size: Decimal,
+    pub min_notional: Option<Decimal>,
+    pub contract_size: Option<Decimal>,
+    pub multiplier: Decimal,
+    pub funding_interval: Option<FundingInterval>,
+}
+
+impl Instrument {
+    pub fn normalize_price(&self, price: Decimal) -> Decimal {
+        let price_steps = (price / self.tick_size).round();
+        price_steps * self.tick_size
+    }
+
+    pub fn normalize_quantity(&self, quantity: Decimal) -> Decimal {
+        let qty_steps = (quantity / self.lot_size).floor();
+        qty_steps * self.lot_size
+    }
+
+    pub fn is_notional_valid(&self, price: Decimal, quantity: Decimal) -> bool {
+        if let Some(min_notional) = self.min_notional {
+            let notional = price * quantity;
+            notional == Decimal::ZERO || notional >= min_notional
+        } else {
+            true
+        }
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct FundingRatePoint {
+    pub funding_rate: Decimal,
+    pub event_time_utc: DateTime<Utc>,
+    pub event_time_ms: i64,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct FundingRateSnapshot {
+    pub key: InstrumentKey,
+    pub funding_rate: Decimal,
+    pub mark_price: Decimal,
+    pub index_price: Decimal,
+    pub interest_rate: Option<Decimal>,
+    pub next_funding_time_utc: DateTime<Utc>,
+    pub next_funding_time_ms: i64,
+    pub event_time_utc: DateTime<Utc>,
+    pub event_time_ms: i64,
+    pub interval: FundingInterval,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct FundingRateSeries {
+    pub key: InstrumentKey,
+    pub interval: FundingInterval,
+    pub points: Vec<FundingRatePoint>,
+}
+
+/// A single price level in an order book (price + available quantity).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct PriceLevel {
+    pub price: Decimal,
+    pub quantity: Decimal,
+}
+
+/// A 5-level order book snapshot (best 5 bids and asks) with pre-computed
+/// convenience fields so callers don't have to recompute them every time.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct Ticker {
+    pub key: InstrumentKey,
+    pub price: Decimal,
+    pub volume_24h: Option<Decimal>,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct Trade {
+    pub key: InstrumentKey,
+    pub trade_id: String,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub side: OrderSide,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct OrderBookSnapshot {
+    pub key: InstrumentKey,
+    /// Up to 5 bid levels, sorted descending by price.
+    pub bids: Vec<PriceLevel>,
+    /// Up to 5 ask levels, sorted ascending by price.
+    pub asks: Vec<PriceLevel>,
+    /// Best (highest) bid price, or `None` when the book is empty.
+    pub best_bid: Option<Decimal>,
+    /// Best (lowest) ask price, or `None` when the book is empty.
+    pub best_ask: Option<Decimal>,
+    /// Mid-price ((best_bid + best_ask) / 2), `None` if either side is missing.
+    pub mid: Option<Decimal>,
+    /// Spread (best_ask - best_bid), `None` if either side is missing.
+    pub spread: Option<Decimal>,
+    pub timestamp_utc: DateTime<Utc>,
+    pub timestamp_ms: i64,
+}
+
+impl OrderBookSnapshot {
+    /// Build a snapshot from raw level lists and fill in the derived fields.
+    pub fn new(
+        key: InstrumentKey,
+        bids: Vec<PriceLevel>,
+        asks: Vec<PriceLevel>,
+        timestamp_utc: DateTime<Utc>,
+        timestamp_ms: i64,
+    ) -> Self {
+        let best_bid = bids.first().map(|l| l.price);
+        let best_ask = asks.first().map(|l| l.price);
+        let mid = best_bid.zip(best_ask).map(|(b, a)| (b + a) / Decimal::TWO);
+        let spread = best_bid.zip(best_ask).map(|(b, a)| a - b);
+        Self {
+            key,
+            bids,
+            asks,
+            best_bid,
+            best_ask,
+            mid,
+            spread,
+            timestamp_utc,
+            timestamp_ms,
+        }
+    }
+}
+
+/// Wraps an `OrderBookSnapshot` for delivery over a channel from a WebSocket
+/// feed task to the `PriceManagerActor`.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct OrderBookUpdate {
+    pub snapshot: OrderBookSnapshot,
+}
+
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum ExecutionMode {
+    Live,
+    Paper,
+}
+
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum OrderType {
+    Market,
+    Limit,
+    PostOnly,
+}
+
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum OrderStatus {
+    New,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+    Rejected,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct OrderRequest {
+    pub key: InstrumentKey,
+    pub strategy_id: String,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub price: Option<Decimal>,
+    pub size: Decimal,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct Order {
+    pub internal_id: String,
+    pub strategy_id: String,
+    pub client_order_id: String,
+    pub exchange_order_id: Option<String>,
+    pub request: OrderRequest,
+    pub status: OrderStatus,
+    pub filled_size: Decimal,
+    pub avg_fill_price: Option<Decimal>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Default for Order {
+    fn default() -> Self {
+        let now = Utc::now();
+        Self {
+            internal_id: String::new(),
+            strategy_id: String::new(),
+            client_order_id: String::new(),
+            exchange_order_id: None,
+            request: OrderRequest {
+                key: InstrumentKey::default(),
+                strategy_id: String::new(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                price: None,
+                size: Decimal::ZERO,
+            },
+            status: OrderStatus::New,
+            filled_size: Decimal::ZERO,
+            avg_fill_price: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum OrderEvent {
+    New(Order),
+    Filled(Order),
+    Canceled(Order),
+    Rejected(Order),
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct Position {
+    pub key: InstrumentKey,
+    pub size: Decimal,
+    pub entry_price: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub leverage: Decimal,
+    pub liquidation_price: Option<Decimal>,
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            key: InstrumentKey::default(),
+            size: Decimal::ZERO,
+            entry_price: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            leverage: Decimal::ONE,
+            liquidation_price: None,
+        }
+    }
+}
+
+impl Position {
+    pub fn apply_fill(&mut self, side: OrderSide, fill_size: Decimal, fill_price: Decimal) {
+        let old_size = self.size;
+        let is_buy = side == OrderSide::Buy;
+
+        let signed_fill_size = if is_buy { fill_size } else { -fill_size };
+        let new_size = old_size + signed_fill_size;
+
+        if new_size.is_zero() {
+            self.entry_price = Decimal::ZERO;
+        } else if old_size.is_zero() || old_size.signum() == signed_fill_size.signum() {
+            let total_value = (old_size.abs() * self.entry_price) + (fill_size * fill_price);
+            self.entry_price = total_value / new_size.abs();
+        }
+
+        self.size = new_size;
+    }
+}
