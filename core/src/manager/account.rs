@@ -8,13 +8,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::warn;
 
 use crate::manager::types::{
-    AccountModel, AccountPartitionRef, AccountSnapshot, BalanceQuery, BalanceView, CollateralScope,
-    CollateralSummary, MarginMode, MarginStateView,
+    AccountModel, AccountPartitionRef, AccountSnapshot, BalanceQuery, BalanceView, BalancesDisplay,
+    CollateralScope, CollateralSummary, MarginMode, MarginStateView,
 };
 use crate::traits::AccountError;
 use crate::types::{Currency, Exchange};
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum AccountManagerError {
     #[error("unsupported account model {requested:?} for exchange {exchange:?}")]
     UnsupportedAccountModel {
@@ -330,15 +330,12 @@ where
             }
             Err(e) => {
                 tracing::error!(exchange = ?exchange, error = %e, "Background account snapshot fetch failed");
-                let reason = e.to_string();
+                let error = AccountManagerError::Other {
+                    reason: e.to_string(),
+                };
                 let pending = self.pending.remove(&exchange).unwrap_or_default();
                 for cmd in pending {
-                    self.reply_with_error(
-                        cmd,
-                        AccountManagerError::Other {
-                            reason: reason.clone(),
-                        },
-                    );
+                    self.reply_with_error(cmd, error.clone());
                 }
             }
         }
@@ -600,6 +597,17 @@ where
         exchange: Exchange,
     ) -> Result<AccountSnapshot, AccountManagerError> {
         let snapshot = self.get_snapshot_cached(exchange)?.clone();
+
+        tracing::info!(
+            exchange = ?exchange,
+            model = ?snapshot.model,
+            partitions = snapshot.partitions.len(),
+            balances = snapshot.balances.len(),
+            as_of = %snapshot.as_of_utc,
+            "Account snapshot reconciled:{}",
+            BalancesDisplay(&snapshot.balances)
+        );
+
         let _ = self.event_tx.send(AccountEvent {
             exchange,
             kind: AccountEventKind::SnapshotReconciled,

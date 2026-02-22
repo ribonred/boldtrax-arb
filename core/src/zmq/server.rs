@@ -247,12 +247,8 @@ impl ZmqServer {
                     )
                 }
             }
-            ZmqCommand::GetInstrument(key) => {
-                ZmqResponse::Instrument(registry.get(&key))
-            }
-            ZmqCommand::GetAllInstruments => {
-                ZmqResponse::AllInstruments(registry.get_all())
-            }
+            ZmqCommand::GetInstrument(key) => ZmqResponse::Instrument(registry.get(&key)),
+            ZmqCommand::GetAllInstruments => ZmqResponse::AllInstruments(registry.get_all()),
         }
     }
 

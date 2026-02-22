@@ -218,6 +218,7 @@ impl From<BinanceSwapMeta<'_>> for Instrument {
             contract_size: meta.context.contract_size,
             multiplier: Decimal::ONE,
             funding_interval: meta.funding_interval_hours.map(hours_to_funding_interval),
+            exchange_id: meta.context.symbol.clone(),
         }
     }
 }
@@ -298,6 +299,7 @@ impl From<BinanceSpotMeta<'_>> for Instrument {
             contract_size: None,
             multiplier: Decimal::ONE,
             funding_interval: None,
+            exchange_id: meta.context.symbol.clone(),
         }
     }
 }
@@ -410,4 +412,110 @@ pub struct BinanceCombinedStreamMsg {
     pub stream: String,
     /// Raw event data — deserialised separately based on stream type.
     pub data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BinanceListenKeyResponse {
+    #[serde(rename = "listenKey")]
+    pub listen_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "e")]
+pub enum BinanceSpotUserDataEvent {
+    #[serde(rename = "executionReport")]
+    ExecutionReport(Box<BinanceSpotExecutionReport>),
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BinanceSpotExecutionReport {
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "c")]
+    pub client_order_id: String,
+    #[serde(rename = "S")]
+    pub side: String,
+    #[serde(rename = "o")]
+    pub order_type: String,
+    #[serde(rename = "X")]
+    pub order_status: String,
+    #[serde(rename = "q")]
+    pub order_quantity: String,
+    #[serde(rename = "p")]
+    pub order_price: String,
+    #[serde(rename = "z")]
+    pub cumulative_filled_quantity: String,
+    #[serde(rename = "L")]
+    pub last_executed_price: String,
+    #[serde(rename = "O")]
+    pub order_creation_time: i64,
+    #[serde(rename = "T")]
+    pub transaction_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "e")]
+pub enum BinanceFuturesUserDataEvent {
+    #[serde(rename = "ORDER_TRADE_UPDATE")]
+    OrderTradeUpdate {
+        #[serde(rename = "o")]
+        order: Box<BinanceFuturesOrderTradeUpdate>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BinanceFuturesOrderTradeUpdate {
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "c")]
+    pub client_order_id: String,
+    #[serde(rename = "S")]
+    pub side: String,
+    #[serde(rename = "o")]
+    pub order_type: String,
+    #[serde(rename = "X")]
+    pub order_status: String,
+    #[serde(rename = "q")]
+    pub original_quantity: String,
+    #[serde(rename = "p")]
+    pub original_price: String,
+    #[serde(rename = "z")]
+    pub order_filled_accumulated_quantity: String,
+    #[serde(rename = "ap")]
+    pub average_price: String,
+    #[serde(rename = "T")]
+    pub order_trade_time: i64,
+}
+
+// ─── Binance WebSocket API (wss://ws-api.binance.com) ────────────────────────
+
+/// Response ack sent by Binance after `userDataStream.subscribe.signature`.
+/// ```json
+/// {"id":"<uuid>","status":200,"result":{"subscriptionId":0},"rateLimits":[...]}
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct BinanceWsApiResponse {
+    pub status: u16,
+    pub result: Option<BinanceWsApiSubscribeResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceWsApiSubscribeResult {
+    pub subscription_id: u64,
+}
+
+/// Wrapper for event frames delivered over the WebSocket API after subscribing.
+/// ```json
+/// {"subscriptionId":0,"event":{...}}
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceWsApiEnvelope {
+    pub subscription_id: u64,
+    pub event: serde_json::Value,
 }

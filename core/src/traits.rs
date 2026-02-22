@@ -5,7 +5,6 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::registry::InstrumentRegistry;
 use crate::types::{
     Currency, FundingInterval, FundingRateSeries, FundingRateSnapshot, Instrument, InstrumentKey,
     OrderBookSnapshot, OrderBookUpdate, Pairs,
@@ -27,7 +26,7 @@ pub enum MarketDataError {
     Other(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum AccountError {
     #[error("unsupported exchange: {0}")]
     UnsupportedExchange(String),
@@ -184,7 +183,7 @@ pub trait MarketDataProvider {
     async fn server_time(&self) -> Result<DateTime<Utc>, MarketDataError>;
     /// Load instruments from the exchange and populate the shared registry.
     /// This should be called once at startup or when instruments need refreshing.
-    async fn load_instruments(&self, registry: &InstrumentRegistry) -> Result<(), MarketDataError>;
+    async fn load_instruments(&self) -> Result<(), MarketDataError>;
 }
 
 #[async_trait]
@@ -192,7 +191,6 @@ pub trait FundingRateMarketData: MarketDataProvider {
     async fn funding_rate_snapshot(
         &self,
         key: InstrumentKey,
-        registry: &InstrumentRegistry,
     ) -> Result<FundingRateSnapshot, MarketDataError>;
 
     async fn funding_rate_history(
@@ -201,7 +199,6 @@ pub trait FundingRateMarketData: MarketDataProvider {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         limit: usize,
-        registry: &InstrumentRegistry,
     ) -> Result<FundingRateSeries, MarketDataError>;
 }
 
@@ -291,7 +288,7 @@ pub trait OrderExecutionProvider: Send + Sync {
     async fn stream_executions(
         &self,
         tx: mpsc::Sender<crate::types::OrderEvent>,
-    ) -> anyhow::Result<()>;
+    ) -> Result<(), AccountError>;
 }
 
 #[async_trait]
@@ -334,7 +331,19 @@ impl<T: OrderExecutionProvider + Send + Sync> OrderExecutionProvider for std::sy
     async fn stream_executions(
         &self,
         tx: mpsc::Sender<crate::types::OrderEvent>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AccountError> {
         self.as_ref().stream_executions(tx).await
+    }
+}
+
+#[async_trait]
+pub trait PositionProvider: Send + Sync {
+    async fn fetch_positions(&self) -> Result<Vec<crate::types::Position>, TradingError>;
+}
+
+#[async_trait]
+impl<T: PositionProvider + Send + Sync> PositionProvider for std::sync::Arc<T> {
+    async fn fetch_positions(&self) -> Result<Vec<crate::types::Position>, TradingError> {
+        self.as_ref().fetch_positions().await
     }
 }

@@ -85,6 +85,35 @@ impl BalanceView {
     }
 }
 
+impl std::fmt::Display for BalanceView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        if let Some(p) = &self.partition {
+            write!(f, "{:?}", p.kind)?;
+        } else {
+            write!(f, "None")?;
+        }
+        write!(
+            f,
+            "] {}: Total: {}, Free: {}, Locked: {}, Borrowed: {}, PnL: {}",
+            self.asset, self.total, self.free, self.locked, self.borrowed, self.unrealized_pnl
+        )
+    }
+}
+
+pub struct BalancesDisplay<'a>(pub &'a [BalanceView]);
+
+impl<'a> std::fmt::Display for BalancesDisplay<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0 {
+            if b.total > rust_decimal::Decimal::ZERO || b.borrowed > rust_decimal::Decimal::ZERO {
+                write!(f, "\n  {}", b)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct CollateralSummary {

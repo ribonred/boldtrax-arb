@@ -9,16 +9,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use moka::sync::Cache;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::traits::{OrderBookFeeder, PriceError};
 use crate::types::{InstrumentKey, OrderBookSnapshot, OrderBookUpdate};
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Error type
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 pub enum PriceManagerError {
@@ -38,10 +35,6 @@ pub enum PriceManagerError {
     FeederError(#[from] PriceError),
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Configuration
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// Configuration for `PriceManagerActor`.
 #[derive(Debug, Clone)]
 pub struct PriceManagerConfig {
@@ -51,6 +44,10 @@ pub struct PriceManagerConfig {
     pub event_broadcast_capacity: usize,
     /// Capacity of the internal WebSocket update channel.
     pub ws_channel_capacity: usize,
+    /// Maximum number of snapshots to keep in the cache.
+    pub max_capacity: u64,
+    /// Time-to-live for cached snapshots.
+    pub time_to_live: std::time::Duration,
 }
 
 impl Default for PriceManagerConfig {
@@ -59,13 +56,11 @@ impl Default for PriceManagerConfig {
             mailbox_capacity: 64,
             event_broadcast_capacity: 256,
             ws_channel_capacity: 256,
+            max_capacity: 10_000,
+            time_to_live: std::time::Duration::from_secs(60),
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Public-facing trait
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// High-level interface exposed to the rest of the application.
 /// `PriceManagerHandle` implements this.
@@ -88,10 +83,6 @@ pub trait PriceManager: Send + Sync {
     /// Subscribe to a stream of live `OrderBookUpdate` events.
     fn subscribe_updates(&self) -> broadcast::Receiver<OrderBookUpdate>;
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Internal command channel
-// ──────────────────────────────────────────────────────────────────────────────
 
 enum PriceCommand {
     GetSnapshot {
@@ -131,7 +122,7 @@ where
     rest_result_rx: mpsc::Receiver<RestFetchResult>,
     event_tx: broadcast::Sender<OrderBookUpdate>,
     /// Latest order-book per instrument.
-    cache: HashMap<InstrumentKey, OrderBookSnapshot>,
+    cache: Cache<InstrumentKey, OrderBookSnapshot>,
     /// Pending replies waiting for a REST fetch to complete.
     pending:
         HashMap<InstrumentKey, Vec<oneshot::Sender<Result<OrderBookSnapshot, PriceManagerError>>>>,
@@ -192,6 +183,11 @@ where
             });
         }
 
+        let cache = Cache::builder()
+            .max_capacity(config.max_capacity)
+            .time_to_live(config.time_to_live)
+            .build();
+
         let actor = Self {
             feeder,
             rx,
@@ -199,7 +195,7 @@ where
             rest_result_tx,
             rest_result_rx,
             event_tx: event_tx.clone(),
-            cache: HashMap::new(),
+            cache,
             pending: HashMap::new(),
             fetching: HashSet::new(),
         };
@@ -236,10 +232,6 @@ where
             }
         }
     }
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // Command handlers
-    // ──────────────────────────────────────────────────────────────────────────
 
     async fn handle_command(&mut self, cmd: PriceCommand) {
         match cmd {

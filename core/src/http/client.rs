@@ -85,6 +85,7 @@ impl HttpClientBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct TracedHttpClient {
     client: ClientWithMiddleware,
     base_url: String,
@@ -169,26 +170,27 @@ impl TracedHttpClient {
                 Ok(response)
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                warn!("Unauthorized request: {}", status);
+                let error_body = Self::extract_error_body(response).await;
+                warn!("Unauthorized request: {} - {}", status, error_body);
                 Err(ClientError::Unauthorized)
             }
             StatusCode::TOO_MANY_REQUESTS => {
-                warn!("Rate limited");
+                let error_body = Self::extract_error_body(response).await;
+                warn!("Rate limited: {} - {}", status, error_body);
                 Err(ClientError::RateLimited)
             }
             StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
-                warn!("Request timeout");
+                let error_body = Self::extract_error_body(response).await;
+                warn!("Request timeout: {} - {}", status, error_body);
                 Err(ClientError::Timeout)
             }
             status if status.is_server_error() => {
-                warn!("Server error: {}", status);
+                let error_body = Self::extract_error_body(response).await;
+                warn!("Server error: {} - {}", status, error_body);
                 Err(ClientError::ServerError(status.as_u16()))
             }
             _ => {
-                let error_body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unable to read error body".to_string());
+                let error_body = Self::extract_error_body(response).await;
                 warn!("Request failed with status {}: {}", status, error_body);
                 Err(ClientError::InvalidResponse(format!(
                     "HTTP {}: {}",
@@ -196,6 +198,21 @@ impl TracedHttpClient {
                 )))
             }
         }
+    }
+
+    async fn extract_error_body(response: Response) -> String {
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to read error body".to_string());
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Ok(pretty) = serde_json::to_string_pretty(&json)
+        {
+            return pretty;
+        }
+
+        text
     }
 
     /// Get base URL

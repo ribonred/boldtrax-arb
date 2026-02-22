@@ -45,12 +45,31 @@ impl DiscoveryClient {
         service_type: ServiceType,
         endpoint: String,
         ttl_secs: u64,
-    ) -> Result<(), redis::RedisError> {
+    ) -> anyhow::Result<()> {
         let key = Self::build_key(exchange, service_type);
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to get Redis connection for ZMQ discovery ({}): {}",
+                    key,
+                    e
+                )
+            })?;
 
         // Initial registration
-        let _: () = conn.set_ex(&key, &endpoint, ttl_secs).await?;
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg(&endpoint)
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to register ZMQ service in Redis ({}): {}", key, e)
+            })?;
         info!(key = %key, endpoint = %endpoint, "Registered ZMQ service in Redis");
 
         // Spawn heartbeat task
@@ -64,8 +83,13 @@ impl DiscoveryClient {
                 interval.tick().await;
                 match client_clone.get_multiplexed_async_connection().await {
                     Ok(mut hb_conn) => {
-                        let res: Result<(), redis::RedisError> =
-                            hb_conn.set_ex(&key, &endpoint_clone, ttl_secs).await;
+                        let res: Result<(), redis::RedisError> = redis::cmd("SET")
+                            .arg(&key)
+                            .arg(&endpoint_clone)
+                            .arg("EX")
+                            .arg(ttl_secs)
+                            .query_async(&mut hb_conn)
+                            .await;
                         if let Err(e) = res {
                             error!(key = %key, error = %e, "Failed to send heartbeat to Redis");
                         } else {

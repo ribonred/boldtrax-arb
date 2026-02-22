@@ -15,6 +15,8 @@ use crate::binance::types::{
     BinanceFundingRateHistory, BinanceFuturesBalance, BinancePartialDepth, BinancePremiumIndex,
     BinanceSpotBalance, BinanceWsDepthEvent,
 };
+use crate::binance::types::{BinanceFuturesOrderTradeUpdate, BinanceSpotExecutionReport};
+use boldtrax_core::types::{Order, OrderEvent, OrderRequest, OrderSide, OrderStatus, OrderType};
 
 pub fn pairs_to_symbol(pair: Pairs) -> String {
     format!("{}{}", pair.base(), pair.quote())
@@ -257,4 +259,124 @@ pub fn ws_depth_event_to_order_book(
         timestamp_utc,
         timestamp_ms,
     ))
+}
+
+pub fn spot_execution_to_order_event(
+    report: &BinanceSpotExecutionReport,
+    key: InstrumentKey,
+) -> Option<OrderEvent> {
+    let side = match report.side.as_str() {
+        "BUY" => OrderSide::Buy,
+        "SELL" => OrderSide::Sell,
+        _ => return None,
+    };
+
+    let order_type = match report.order_type.as_str() {
+        "MARKET" => OrderType::Market,
+        "LIMIT" => OrderType::Limit,
+        _ => return None,
+    };
+
+    let status = match report.order_status.as_str() {
+        "NEW" => OrderStatus::New,
+        "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+        "FILLED" => OrderStatus::Filled,
+        "CANCELED" => OrderStatus::Canceled,
+        "REJECTED" => OrderStatus::Rejected,
+        "EXPIRED" => OrderStatus::Canceled,
+        _ => return None,
+    };
+
+    let size = Decimal::from_str(&report.order_quantity).ok()?;
+    let price = Decimal::from_str(&report.order_price)
+        .ok()
+        .filter(|p| !p.is_zero());
+    let filled_size = Decimal::from_str(&report.cumulative_filled_quantity).ok()?;
+    let avg_fill_price = Decimal::from_str(&report.last_executed_price)
+        .ok()
+        .filter(|p| !p.is_zero());
+
+    let request = OrderRequest {
+        key,
+        side,
+        order_type,
+        price,
+        size,
+        strategy_id: "".to_string(), // Binance doesn't return our internal strategy ID
+    };
+
+    let order = Order {
+        internal_id: report.client_order_id.clone(),
+        strategy_id: "".to_string(), // OrderManager will fill this in based on internal_id
+        client_order_id: report.client_order_id.clone(),
+        exchange_order_id: Some(report.client_order_id.clone()),
+        request,
+        status,
+        filled_size,
+        avg_fill_price,
+        created_at: ms_to_datetime(report.order_creation_time)?,
+        updated_at: ms_to_datetime(report.transaction_time)?,
+    };
+
+    Some(order.into())
+}
+
+pub fn futures_execution_to_order_event(
+    report: &BinanceFuturesOrderTradeUpdate,
+    key: InstrumentKey,
+) -> Option<OrderEvent> {
+    let side = match report.side.as_str() {
+        "BUY" => OrderSide::Buy,
+        "SELL" => OrderSide::Sell,
+        _ => return None,
+    };
+
+    let order_type = match report.order_type.as_str() {
+        "MARKET" => OrderType::Market,
+        "LIMIT" => OrderType::Limit,
+        _ => return None,
+    };
+
+    let status = match report.order_status.as_str() {
+        "NEW" => OrderStatus::New,
+        "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+        "FILLED" => OrderStatus::Filled,
+        "CANCELED" => OrderStatus::Canceled,
+        "REJECTED" => OrderStatus::Rejected,
+        "EXPIRED" => OrderStatus::Canceled,
+        _ => return None,
+    };
+
+    let size = Decimal::from_str(&report.original_quantity).ok()?;
+    let price = Decimal::from_str(&report.original_price)
+        .ok()
+        .filter(|p| !p.is_zero());
+    let filled_size = Decimal::from_str(&report.order_filled_accumulated_quantity).ok()?;
+    let avg_fill_price = Decimal::from_str(&report.average_price)
+        .ok()
+        .filter(|p| !p.is_zero());
+
+    let request = OrderRequest {
+        key,
+        side,
+        order_type,
+        price,
+        size,
+        strategy_id: "".to_string(),
+    };
+
+    let order = Order {
+        internal_id: report.client_order_id.clone(),
+        strategy_id: "".to_string(), // OrderManager will fill this in based on internal_id
+        client_order_id: report.client_order_id.clone(),
+        exchange_order_id: Some(report.client_order_id.clone()),
+        request,
+        status,
+        filled_size,
+        avg_fill_price,
+        created_at: ms_to_datetime(report.order_trade_time)?,
+        updated_at: ms_to_datetime(report.order_trade_time)?,
+    };
+
+    Some(order.into())
 }

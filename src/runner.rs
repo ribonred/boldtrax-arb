@@ -21,6 +21,7 @@ use boldtrax_core::manager::price::{
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
     FundingRateMarketData, MarketDataProvider, OrderBookFeeder, OrderExecutionProvider,
+    PositionProvider,
 };
 use boldtrax_core::types::{Exchange, ExecutionMode, InstrumentKey};
 use thiserror::Error;
@@ -122,16 +123,17 @@ where
         + AccountSnapshotSource
         + OrderBookFeeder
         + OrderExecutionProvider
+        + PositionProvider
         + Send
         + Sync
         + 'static,
 {
     /// Create a new runner with `client` wrapped in an `Arc` internally so it
     /// can be shared across all spawned tasks without cloning.
-    pub fn new(client: C, config: ExchangeRunnerConfig) -> Self {
+    pub fn new(client: C, config: ExchangeRunnerConfig, registry: InstrumentRegistry) -> Self {
         Self {
             client: Arc::new(client),
-            registry: InstrumentRegistry::new(),
+            registry,
             config,
         }
     }
@@ -139,10 +141,14 @@ where
     /// With a pre-built `Arc<C>` (e.g. when the caller needs the client handle
     /// independently of the runner).
     #[allow(dead_code)]
-    pub fn with_arc(client: Arc<C>, config: ExchangeRunnerConfig) -> Self {
+    pub fn with_arc(
+        client: Arc<C>,
+        config: ExchangeRunnerConfig,
+        registry: InstrumentRegistry,
+    ) -> Self {
         Self {
             client,
-            registry: InstrumentRegistry::new(),
+            registry,
             config,
         }
     }
@@ -156,7 +162,7 @@ where
         );
         info!(exchange = ?self.config.exchange, "Loading instruments");
         self.client
-            .load_instruments(&self.registry)
+            .load_instruments()
             .await
             .map_err(|e| RunnerError::InstrumentLoad(e.to_string()))?;
         info!(
@@ -191,6 +197,7 @@ where
 
         // ── 5. Spawn position manager actor
         let position_handle: PositionManagerHandle = PositionManagerActor::spawn(
+            Arc::clone(&self.client),
             order_handle.subscribe_events(),
             self.config.position_manager_config.clone(),
         );
@@ -209,7 +216,7 @@ where
 
         let zmq_task = tokio::spawn(async move {
             if let Err(e) = zmq_server.run().await {
-                error!(error = %e, "ZmqServer failed");
+                error!(error = ?e, "ZmqServer failed");
             }
         });
 
@@ -248,21 +255,10 @@ where
             tokio::spawn(async move {
                 info!(exchange = ?exchange, interval_secs = interval.as_secs(), "Account reconcile loop started");
                 loop {
-                    tokio::time::sleep(interval).await;
-                    match handle.reconcile_snapshot(exchange).await {
-                        Ok(snap) => {
-                            info!(
-                                exchange = ?exchange,
-                                partitions = snap.partitions.len(),
-                                balances = snap.balances.len(),
-                                as_of = %snap.as_of_utc,
-                                "Account snapshot reconciled"
-                            );
-                        }
-                        Err(e) => {
-                            error!(exchange = ?exchange, error = %e, "Account reconcile failed");
-                        }
+                    if let Err(e) = handle.reconcile_snapshot(exchange).await {
+                        error!(exchange = ?exchange, error = %e, "Account reconcile failed");
                     }
+                    tokio::time::sleep(interval).await;
                 }
             })
         };
@@ -270,7 +266,6 @@ where
         // ── 5. Funding rate poll loop
         let funding_task: JoinHandle<()> = {
             let client = Arc::clone(&self.client);
-            let registry = self.registry.clone();
             let keys = self.config.tracked_keys.clone();
             let interval = self.config.funding_rate_poll_interval;
             let exchange = self.config.exchange;
@@ -294,7 +289,7 @@ where
                 );
                 loop {
                     for key in &swap_keys {
-                        match client.funding_rate_snapshot(*key, &registry).await {
+                        match client.funding_rate_snapshot(*key).await {
                             Ok(snap) => {
                                 let _ = zmq_tx_funding.send(ZmqEvent::FundingRate(snap.clone()));
                                 info!(

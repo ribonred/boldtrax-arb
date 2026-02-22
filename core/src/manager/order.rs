@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -245,12 +246,15 @@ where
         }
 
         let timestamp_ms = Utc::now().timestamp_millis();
-        let internal_id = format!(
+        let mut internal_id = String::with_capacity(64);
+        write!(
+            internal_id,
             "{}-{}-{}",
             normalized_req.strategy_id,
             timestamp_ms,
             self.exchange.short_code()
-        );
+        )
+        .unwrap();
         let client_order_id = self.provider.format_client_id(&internal_id);
 
         let now = Utc::now();
@@ -259,6 +263,7 @@ where
             strategy_id: normalized_req.strategy_id.clone(),
             client_order_id: client_order_id.clone(),
             request: normalized_req.clone(),
+            status: OrderStatus::PendingSubmit,
             created_at: now,
             updated_at: now,
             ..Default::default()
@@ -339,6 +344,14 @@ where
                         order.exchange_order_id = rest_order.exchange_order_id;
                         order.updated_at = Utc::now();
                     }
+
+                    // Only transition to New if we are still in PendingSubmit.
+                    // If WS already moved us to PartiallyFilled or Filled, don't downgrade the status.
+                    if order.is_pending_submit() {
+                        order.mark_new();
+                        let _ = self.event_tx.send(order.clone().into());
+                    }
+
                     debug!(internal_id = %internal_id, "REST submit confirmed");
                 } else {
                     // Order was already fully processed by WS and removed from active_orders
@@ -350,11 +363,10 @@ where
                 error!(internal_id = %internal_id, error = %e, "REST submit failed");
                 if let Some(mut order) = self.active_orders.remove(&internal_id) {
                     // Only reject if it hasn't been partially filled by WS already
-                    if order.status == OrderStatus::New {
-                        order.status = OrderStatus::Rejected;
-                        order.updated_at = Utc::now();
+                    if order.is_pending_or_new() {
+                        order.mark_rejected();
                         self.client_id_map.remove(&order.client_order_id);
-                        let _ = self.event_tx.send(OrderEvent::Rejected(order));
+                        let _ = self.event_tx.send(order.clone().into());
                     } else {
                         // It was partially filled by WS before REST returned an error?
                         // This is a weird edge case (e.g. timeout on REST but exchange accepted it).
@@ -381,7 +393,7 @@ where
                 self.client_id_map.remove(&canceled_order.client_order_id);
 
                 // Broadcast Canceled event
-                let _ = self.event_tx.send(OrderEvent::Canceled(canceled_order));
+                let _ = self.event_tx.send(canceled_order.into());
             }
             Err(e) => {
                 error!(internal_id = %internal_id, error = %e, "REST cancel failed");
@@ -390,57 +402,52 @@ where
     }
 
     async fn handle_ws_event(&mut self, event: OrderEvent) {
-        let order = match &event {
-            OrderEvent::New(o) => o,
-            OrderEvent::Filled(o) => o,
-            OrderEvent::Canceled(o) => o,
-            OrderEvent::Rejected(o) => o,
-        };
+        let exchange_order = event.inner();
 
         // Try to resolve internal_id from client_order_id if not present
-        let internal_id = if order.internal_id.is_empty() {
-            if let Some(id) = self.client_id_map.get(&order.client_order_id) {
+        let internal_id = if exchange_order.internal_id.is_empty() {
+            if let Some(id) = self.client_id_map.get(&exchange_order.client_order_id) {
                 id.clone()
             } else {
-                warn!(
-                    client_order_id = %order.client_order_id,
-                    "Received WS event for unknown order"
+                panic!(
+                    "FATAL: Received WS event for unknown order (client_order_id: {}). Executing orders outside the strategy is fatal.",
+                    exchange_order.client_order_id
                 );
-                return;
             }
         } else {
-            order.internal_id.clone()
+            exchange_order.internal_id.clone()
         };
+
+        // Get the internal order
+        let mut internal_order = if let Some(order) = self.active_orders.get(&internal_id) {
+            order.clone()
+        } else {
+            panic!(
+                "FATAL: Received WS event for untracked order (internal_id: {}, client_order_id: {}). Order state lost or executed outside strategy.",
+                internal_id, exchange_order.client_order_id
+            );
+        };
+
+        // Mutate internal order with exchange order data
+        internal_order.apply_exchange_update(exchange_order);
 
         debug!(
             internal_id = %internal_id,
-            status = ?order.status,
+            status = ?internal_order.status,
             "Received WS order event"
         );
 
         // Update state
-        match order.status {
-            OrderStatus::New | OrderStatus::PartiallyFilled => {
-                self.active_orders
-                    .insert(internal_id.clone(), order.clone());
-            }
-            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected => {
-                self.active_orders.remove(&internal_id);
-                self.client_id_map.remove(&order.client_order_id);
-            }
+        if internal_order.is_final_state() {
+            self.active_orders.remove(&internal_id);
+            self.client_id_map.remove(&internal_order.client_order_id);
+        } else {
+            self.active_orders
+                .insert(internal_id.clone(), internal_order.clone());
         }
 
         // Broadcast
-        let mut enriched_event = event.clone();
-        match &mut enriched_event {
-            OrderEvent::New(o)
-            | OrderEvent::Filled(o)
-            | OrderEvent::Canceled(o)
-            | OrderEvent::Rejected(o) => {
-                o.internal_id = internal_id;
-            }
-        }
-        let _ = self.event_tx.send(enriched_event);
+        let _ = self.event_tx.send(internal_order.into());
     }
 
     async fn process_reconcile(&mut self) {
@@ -481,26 +488,18 @@ where
 
                         // Fetch final status to see if it filled or canceled
                         match self.provider.get_order_status(key, &client_order_id).await {
-                            Ok(final_order) => {
+                            Ok(mut final_order) => {
                                 // Inject internal_id
-                                let mut final_order = final_order;
                                 final_order.internal_id = internal_id.clone();
 
-                                let event = match final_order.status {
-                                    OrderStatus::Filled => OrderEvent::Filled(final_order.clone()),
-                                    OrderStatus::Canceled => {
-                                        OrderEvent::Canceled(final_order.clone())
-                                    }
-                                    OrderStatus::Rejected => {
-                                        OrderEvent::Rejected(final_order.clone())
-                                    }
-                                    _ => continue, // Still open somehow?
-                                };
+                                if !final_order.is_final_state() {
+                                    continue; // Still open somehow?
+                                }
 
                                 // Update state and broadcast
                                 self.active_orders.remove(&internal_id);
                                 self.client_id_map.remove(&client_order_id);
-                                let _ = self.event_tx.send(event);
+                                let _ = self.event_tx.send(final_order.into());
                             }
                             Err(e) => {
                                 error!(

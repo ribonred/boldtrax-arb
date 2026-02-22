@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, RwLock};
 
 use crate::types::{Exchange, Instrument, InstrumentKey, InstrumentType, Pairs};
@@ -13,6 +15,8 @@ struct InstrumentRegistryInner {
     instruments: HashMap<InstrumentKey, Instrument>,
     by_exchange: HashMap<Exchange, Vec<InstrumentKey>>,
     by_pair: HashMap<Pairs, Vec<InstrumentKey>>,
+    /// (exchange, exchange_symbol, instrument_type) → InstrumentKey for O(log n) lookup
+    by_exchange_symbol: BTreeMap<(Exchange, String, InstrumentType), InstrumentKey>,
 }
 
 impl InstrumentRegistry {
@@ -23,32 +27,65 @@ impl InstrumentRegistry {
     }
 
     pub fn insert(&self, instrument: Instrument) {
-        let mut inner = self.inner.write().expect("lock poisoned");
         let key = instrument.key;
+        let mut inner = self.inner.write().expect("lock poisoned");
+
+        // If it already exists, we don't need to update the indices
+        if let Entry::Occupied(mut e) = inner.instruments.entry(key) {
+            e.insert(instrument);
+            return;
+        }
 
         // Update by_exchange index
-        inner
-            .by_exchange
-            .entry(key.exchange)
-            .or_default()
-            .retain(|k| *k != key);
         inner.by_exchange.entry(key.exchange).or_default().push(key);
 
         // Update by_pair index
-        inner
-            .by_pair
-            .entry(key.pair)
-            .or_default()
-            .retain(|k| *k != key);
         inner.by_pair.entry(key.pair).or_default().push(key);
+
+        // Update by_exchange_symbol index
+        inner.by_exchange_symbol.insert(
+            (
+                key.exchange,
+                instrument.exchange_symbol.clone(),
+                key.instrument_type,
+            ),
+            key,
+        );
 
         // Insert instrument
         inner.instruments.insert(key, instrument);
     }
 
     pub fn insert_batch(&self, instruments: Vec<Instrument>) {
+        let mut inner = self.inner.write().expect("lock poisoned");
+
         for instrument in instruments {
-            self.insert(instrument);
+            let key = instrument.key;
+
+            // If it already exists, we don't need to update the indices
+            if let Entry::Occupied(mut e) = inner.instruments.entry(key) {
+                e.insert(instrument);
+                continue;
+            }
+
+            // Update by_exchange index
+            inner.by_exchange.entry(key.exchange).or_default().push(key);
+
+            // Update by_pair index
+            inner.by_pair.entry(key.pair).or_default().push(key);
+
+            // Update by_exchange_symbol index
+            inner.by_exchange_symbol.insert(
+                (
+                    key.exchange,
+                    instrument.exchange_symbol.clone(),
+                    key.instrument_type,
+                ),
+                key,
+            );
+
+            // Insert instrument
+            inner.instruments.insert(key, instrument);
         }
     }
 
@@ -116,10 +153,24 @@ impl InstrumentRegistry {
         self.len() == 0
     }
 
+    pub fn get_by_exchange_symbol(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        instrument_type: InstrumentType,
+    ) -> Option<Instrument> {
+        let inner = self.inner.read().expect("lock poisoned");
+        let key = inner
+            .by_exchange_symbol
+            .get(&(exchange, symbol.to_string(), instrument_type))?;
+        inner.instruments.get(key).cloned()
+    }
+
     pub fn clear(&self) {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.instruments.clear();
         inner.by_exchange.clear();
         inner.by_pair.clear();
+        inner.by_exchange_symbol.clear();
     }
 }

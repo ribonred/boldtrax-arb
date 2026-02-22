@@ -87,6 +87,7 @@ impl ZmqEvent {
             ZmqEvent::OrderUpdate(event) => {
                 let order = match event {
                     OrderEvent::New(o) => o,
+                    OrderEvent::PartiallyFilled(o) => o,
                     OrderEvent::Filled(o) => o,
                     OrderEvent::Canceled(o) => o,
                     OrderEvent::Rejected(o) => o,

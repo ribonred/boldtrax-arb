@@ -4,7 +4,7 @@ use boldtrax_core::manager::types::{AccountModel, AccountSnapshot, BalanceView, 
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
     FundingRateMarketData, MarketDataError, MarketDataProvider, OrderBookFeeder,
-    OrderExecutionProvider, PriceError, TradingError,
+    OrderExecutionProvider, PositionProvider, PriceError, TradingError,
 };
 use boldtrax_core::types::{
     Currency, Exchange, FundingRateSeries, FundingRateSnapshot, InstrumentKey, Order,
@@ -58,14 +58,17 @@ pub struct MockExchange<T> {
     inner: T,
     state: Arc<RwLock<MockState>>,
     exchange: Exchange,
+    #[allow(dead_code)]
+    registry: InstrumentRegistry,
 }
 
 impl<T> MockExchange<T> {
-    pub fn new(inner: T, exchange: Exchange) -> Self {
+    pub fn new(inner: T, exchange: Exchange, registry: InstrumentRegistry) -> Self {
         Self {
             inner,
             state: Arc::new(RwLock::new(MockState::default())),
             exchange,
+            registry,
         }
     }
 
@@ -84,8 +87,8 @@ impl<T: MarketDataProvider + Send + Sync> MarketDataProvider for MockExchange<T>
         self.inner.server_time().await
     }
 
-    async fn load_instruments(&self, registry: &InstrumentRegistry) -> Result<(), MarketDataError> {
-        self.inner.load_instruments(registry).await
+    async fn load_instruments(&self) -> Result<(), MarketDataError> {
+        self.inner.load_instruments().await
     }
 }
 
@@ -94,9 +97,8 @@ impl<T: FundingRateMarketData + Send + Sync> FundingRateMarketData for MockExcha
     async fn funding_rate_snapshot(
         &self,
         key: InstrumentKey,
-        registry: &InstrumentRegistry,
     ) -> Result<FundingRateSnapshot, MarketDataError> {
-        self.inner.funding_rate_snapshot(key, registry).await
+        self.inner.funding_rate_snapshot(key).await
     }
 
     async fn funding_rate_history(
@@ -105,10 +107,9 @@ impl<T: FundingRateMarketData + Send + Sync> FundingRateMarketData for MockExcha
         start: chrono::DateTime<Utc>,
         end: chrono::DateTime<Utc>,
         limit: usize,
-        registry: &InstrumentRegistry,
     ) -> Result<FundingRateSeries, MarketDataError> {
         self.inner
-            .funding_rate_history(key, start, end, limit, registry)
+            .funding_rate_history(key, start, end, limit)
             .await
     }
 }
@@ -305,8 +306,7 @@ impl<T: OrderBookFeeder + Send + Sync> OrderExecutionProvider for MockExchange<T
     ) -> Result<Order, TradingError> {
         let mut state = self.state.write().await;
         if let Some(mut order) = state.open_orders.remove(client_order_id) {
-            order.status = OrderStatus::Canceled;
-            order.updated_at = Utc::now();
+            order.mark_canceled();
             Ok(order)
         } else {
             Err(TradingError::OrderNotFound {
@@ -345,12 +345,20 @@ impl<T: OrderBookFeeder + Send + Sync> OrderExecutionProvider for MockExchange<T
     async fn stream_executions(
         &self,
         _tx: mpsc::Sender<boldtrax_core::types::OrderEvent>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), boldtrax_core::AccountError> {
         // In a real mock, we might want to simulate order fills over time here.
         // For now, we just keep the stream open.
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
+    }
+}
+
+#[async_trait]
+impl<T: Send + Sync> PositionProvider for MockExchange<T> {
+    async fn fetch_positions(&self) -> Result<Vec<Position>, TradingError> {
+        let state = self.state.read().await;
+        Ok(state.positions.values().cloned().collect())
     }
 }
 
@@ -395,7 +403,8 @@ mod tests {
     #[tokio::test]
     async fn test_mock_exchange_market_buy() {
         let client = DummyClient;
-        let mock = MockExchange::new(client, Exchange::Binance);
+        let registry = InstrumentRegistry::new();
+        let mock = MockExchange::new(client, Exchange::Binance, registry);
 
         let key = InstrumentKey {
             exchange: Exchange::Binance,

@@ -1,52 +1,79 @@
 //! Binance exchange client
 
 use async_trait::async_trait;
-use boldtrax_core::AccountSnapshot;
 use boldtrax_core::http::{BinanceHmacAuth, HttpClientBuilder, TracedHttpClient};
 use boldtrax_core::manager::account::{AccountManagerError, AccountSnapshotSource};
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
     Account, AccountError, BaseInstrumentMeta, FundingRateMarketData, MarketDataError,
-    MarketDataProvider, OrderBookFeeder, OrderExecutionProvider, PriceError, TradingError,
+    MarketDataProvider, OrderBookFeeder, OrderExecutionProvider, PositionProvider, PriceError,
+    TradingError,
 };
 use boldtrax_core::types::{
     FundingInterval, FundingRateSeries, FundingRateSnapshot, Instrument, InstrumentKey,
     InstrumentType, Order, OrderBookSnapshot, OrderBookUpdate, OrderRequest,
 };
+use boldtrax_core::ws::{CancellationToken, ws_supervisor_spawn};
+use boldtrax_core::{AccountSnapshot, Exchange, OrderEvent, Position};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio::sync::{OnceCell, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+
+use crate::binance::ws::{
+    BinanceDepthPolicy, BinanceFuturesUserDataPolicy, BinanceSpotUserDataPolicy,
+};
 
 use crate::binance::mappers::{
-    build_segmented_account_snapshot, funding_history_to_series, ms_to_datetime, pairs_to_symbol,
-    partial_depth_to_order_book, premium_index_to_snapshot, ws_depth_event_to_order_book,
+    build_segmented_account_snapshot, funding_history_to_series, ms_to_datetime,
+    partial_depth_to_order_book, premium_index_to_snapshot,
 };
 use crate::binance::types::{
-    BinanceCombinedStreamMsg, BinanceFundingInfo, BinanceFundingRateHistory, BinanceFuturesBalance,
+    BinanceFundingInfo, BinanceFundingRateHistory, BinanceFuturesBalance,
     BinanceFuturesExchangeInfo, BinancePartialDepth, BinancePremiumIndex, BinanceServerTime,
     BinanceSpotAccount, BinanceSpotBalance, BinanceSpotExchangeInfo, BinanceSpotMeta,
-    BinanceSwapMeta, BinanceWsDepthEvent,
+    BinanceSwapMeta,
 };
+
+use boldtrax_core::config::types::ExchangeConfig;
+use serde::Deserialize;
 
 const BINANCE_FUTURES_BASE_URL: &str = "https://fapi.binance.com";
 const BINANCE_SPOT_BASE_URL: &str = "https://api.binance.com";
+const BINANCE_FUTURES_TESTNET_URL: &str = "https://testnet.binancefuture.com";
+const BINANCE_SPOT_TESTNET_URL: &str = "https://testnet.binance.vision";
 const BINANCE_FUTURES_WS_BASE_URL: &str = "wss://fstream.binance.com";
 const BINANCE_SPOT_WS_BASE_URL: &str = "wss://stream.binance.com:9443";
+const BINANCE_FUTURES_WS_TESTNET_URL: &str = "wss://stream.binancefuture.com";
+const BINANCE_SPOT_WS_TESTNET_URL: &str = "wss://testnet.binance.vision:443";
+/// Binance WebSocket API endpoint for authenticated Spot user-data streams.
+const BINANCE_SPOT_WS_API_URL: &str = "wss://ws-api.binance.com:443/ws-api/v3";
 
 /// Binance API mode configuration
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BinanceApiMode {
     Futures,
     Spot,
+    #[default]
     Both,
 }
 
+fn default_timeout() -> u64 {
+    30
+}
+fn default_retries() -> u32 {
+    3
+}
+
 /// Binance client configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BinanceConfig {
+    #[serde(default)]
     pub mode: BinanceApiMode,
+    #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    #[serde(default = "default_retries")]
     pub max_retries: u32,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
@@ -54,18 +81,25 @@ pub struct BinanceConfig {
     pub futures_base_url: Option<String>,
     /// Custom base URL for spot API (for testing)
     pub spot_base_url: Option<String>,
+    #[serde(default)]
+    pub testnet: bool,
+}
+
+impl ExchangeConfig for BinanceConfig {
+    const EXCHANGE_NAME: &'static str = "binance";
 }
 
 impl Default for BinanceConfig {
     fn default() -> Self {
         Self {
             mode: BinanceApiMode::Both,
-            timeout_secs: 30,
-            max_retries: 3,
+            timeout_secs: default_timeout(),
+            max_retries: default_retries(),
             api_key: None,
             api_secret: None,
             futures_base_url: None,
             spot_base_url: None,
+            testnet: false,
         }
     }
 }
@@ -74,6 +108,7 @@ impl Default for BinanceConfig {
 pub struct BinanceClient {
     #[allow(dead_code)]
     config: BinanceConfig,
+    registry: InstrumentRegistry,
     futures_public_client: Option<TracedHttpClient>,
     spot_public_client: Option<TracedHttpClient>,
     futures_private_client: Option<TracedHttpClient>,
@@ -83,15 +118,24 @@ pub struct BinanceClient {
 }
 
 impl BinanceClient {
-    pub fn new(config: BinanceConfig) -> Result<Self, MarketDataError> {
-        let futures_base_url = config
-            .futures_base_url
-            .clone()
-            .unwrap_or_else(|| BINANCE_FUTURES_BASE_URL.to_string());
-        let spot_base_url = config
-            .spot_base_url
-            .clone()
-            .unwrap_or_else(|| BINANCE_SPOT_BASE_URL.to_string());
+    pub fn new(
+        config: BinanceConfig,
+        registry: InstrumentRegistry,
+    ) -> Result<Self, MarketDataError> {
+        let futures_base_url = config.futures_base_url.clone().unwrap_or_else(|| {
+            if config.testnet {
+                BINANCE_FUTURES_TESTNET_URL.to_string()
+            } else {
+                BINANCE_FUTURES_BASE_URL.to_string()
+            }
+        });
+        let spot_base_url = config.spot_base_url.clone().unwrap_or_else(|| {
+            if config.testnet {
+                BINANCE_SPOT_TESTNET_URL.to_string()
+            } else {
+                BINANCE_SPOT_BASE_URL.to_string()
+            }
+        });
 
         let futures_public_client =
             if matches!(config.mode, BinanceApiMode::Futures | BinanceApiMode::Both) {
@@ -163,6 +207,7 @@ impl BinanceClient {
 
         Ok(Self {
             config,
+            registry,
             futures_public_client,
             spot_public_client,
             futures_private_client,
@@ -281,13 +326,13 @@ impl BinanceClient {
 
 #[async_trait]
 impl MarketDataProvider for BinanceClient {
-    async fn load_instruments(&self, registry: &InstrumentRegistry) -> Result<(), MarketDataError> {
+    async fn load_instruments(&self) -> Result<(), MarketDataError> {
         self.instruments_loaded
             .get_or_try_init(|| async {
                 info!("Loading Binance instruments...");
                 let instruments = self.fetch_instruments().await?;
-                registry.insert_batch(instruments);
-                info!("Binance instruments loaded: {} total", registry.len());
+                self.registry.insert_batch(instruments);
+                info!("Binance instruments loaded: {} total", self.registry.len());
                 Ok::<(), MarketDataError>(())
             })
             .await
@@ -336,7 +381,6 @@ impl FundingRateMarketData for BinanceClient {
     async fn funding_rate_snapshot(
         &self,
         key: InstrumentKey,
-        registry: &InstrumentRegistry,
     ) -> Result<FundingRateSnapshot, MarketDataError> {
         // Funding rate only for Swap/Futures
         if key.instrument_type != InstrumentType::Swap {
@@ -344,13 +388,16 @@ impl FundingRateMarketData for BinanceClient {
         }
 
         // Get funding interval from registry (caller should have loaded instruments)
-        let interval = registry
+        let instrument = self
+            .registry
             .get(&key)
-            .and_then(|i| i.funding_interval)
+            .ok_or(MarketDataError::UnsupportedInstrument)?;
+        let interval = instrument
+            .funding_interval
             .unwrap_or(FundingInterval::Every8Hours);
 
         let client = self.futures_client()?;
-        let symbol = pairs_to_symbol(key.pair);
+        let symbol = instrument.exchange_symbol;
         let path = format!("/fapi/v1/premiumIndex?symbol={symbol}");
 
         debug!("Fetching premium index for {}", symbol);
@@ -370,7 +417,6 @@ impl FundingRateMarketData for BinanceClient {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         limit: usize,
-        registry: &InstrumentRegistry,
     ) -> Result<FundingRateSeries, MarketDataError> {
         // Funding rate only for Swap/Futures
         if key.instrument_type != InstrumentType::Swap {
@@ -378,13 +424,16 @@ impl FundingRateMarketData for BinanceClient {
         }
 
         // Get funding interval from registry (caller should have loaded instruments)
-        let interval = registry
+        let instrument = self
+            .registry
             .get(&key)
-            .and_then(|i| i.funding_interval)
+            .ok_or(MarketDataError::UnsupportedInstrument)?;
+        let interval = instrument
+            .funding_interval
             .unwrap_or(FundingInterval::Every8Hours);
 
         let client = self.futures_client()?;
-        let symbol = pairs_to_symbol(key.pair);
+        let symbol = instrument.exchange_symbol;
         let start_ms = start.timestamp_millis();
         let end_ms = end.timestamp_millis();
         let limit = limit.min(1000); // Binance max is 1000
@@ -447,9 +496,9 @@ impl Account for BinanceClient {
 impl AccountSnapshotSource for BinanceClient {
     async fn fetch_account_snapshot(
         &self,
-        exchange: boldtrax_core::types::Exchange,
-    ) -> Result<boldtrax_core::manager::types::AccountSnapshot, AccountManagerError> {
-        if exchange != boldtrax_core::types::Exchange::Binance {
+        exchange: Exchange,
+    ) -> Result<AccountSnapshot, AccountManagerError> {
+        if exchange != Exchange::Binance {
             return Err(AccountManagerError::Other {
                 reason: format!("unsupported exchange for BinanceClient: {exchange:?}"),
             });
@@ -508,101 +557,96 @@ impl OrderExecutionProvider for BinanceClient {
         ))
     }
 
-    async fn stream_executions(
-        &self,
-        _tx: mpsc::Sender<boldtrax_core::types::OrderEvent>,
-    ) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!(
-            "Binance stream_executions not implemented yet"
-        ))
+    async fn stream_executions(&self, tx: mpsc::Sender<OrderEvent>) -> Result<(), AccountError> {
+        let include_spot = matches!(
+            self.config.mode,
+            BinanceApiMode::Spot | BinanceApiMode::Both
+        );
+        let include_futures = matches!(
+            self.config.mode,
+            BinanceApiMode::Futures | BinanceApiMode::Both
+        );
+
+        let cancel = CancellationToken::new();
+
+        // Cancel all supervisors when the receiver side of the channel is dropped.
+        let cancel_on_close = cancel.clone();
+        let tx_watcher = tx.clone();
+        tokio::spawn(async move {
+            tx_watcher.closed().await;
+            cancel_on_close.cancel();
+        });
+
+        let mut handles = Vec::new();
+
+        if include_spot {
+            let (api_key, api_secret) = {
+                let key = self.config.api_key.clone().ok_or_else(|| {
+                    AccountError::Other("missing api_key for Spot WS stream".to_string())
+                })?;
+                let secret = self.config.api_secret.clone().ok_or_else(|| {
+                    AccountError::Other("missing api_secret for Spot WS stream".to_string())
+                })?;
+                (key, secret)
+            };
+
+            let ws_api_url = BINANCE_SPOT_WS_API_URL.to_string();
+            let policy = BinanceSpotUserDataPolicy::new(
+                ws_api_url,
+                api_key,
+                api_secret,
+                self.registry.clone(),
+                tx.clone(),
+            );
+            handles.push(ws_supervisor_spawn(policy, cancel.clone()));
+            info!("Binance Spot user-data supervisor spawned (WS API)");
+        }
+
+        if include_futures {
+            let client = self.futures_private_client()?.clone();
+            let base_ws_url = if self.config.testnet {
+                BINANCE_FUTURES_WS_TESTNET_URL
+            } else {
+                BINANCE_FUTURES_WS_BASE_URL
+            }
+            .to_string();
+
+            let policy = BinanceFuturesUserDataPolicy::new(
+                client,
+                base_ws_url,
+                self.registry.clone(),
+                tx.clone(),
+            );
+            handles.push(ws_supervisor_spawn(policy, cancel.clone()));
+            info!("Binance Futures user-data supervisor spawned");
+        }
+
+        // Block until all supervisors exit (triggered by cancellation or fatal error).
+        for handle in handles {
+            handle.join().await;
+        }
+
+        Ok(())
     }
 }
 
-/// Internal helper: connect to a Binance combined-stream WebSocket URL
-/// and forward parsed `OrderBookUpdate` messages to `tx`.
-///
-/// Returns when the stream closes or when the receiver side of `tx` is dropped.
-async fn stream_ws_depth(
-    url: String,
-    symbol_to_key: HashMap<String, InstrumentKey>,
-    tx: mpsc::Sender<OrderBookUpdate>,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use futures_util::StreamExt;
-    use tokio_tungstenite::connect_async;
-    use tokio_tungstenite::tungstenite::Message;
-
-    info!(url = %url, "Connecting to Binance WS depth stream");
-    let (mut ws_stream, _) = connect_async(&url)
-        .await
-        .with_context(|| format!("Failed to connect to Binance WS: {url}"))?;
-    info!(url = %url, "Binance WS depth stream connected");
-
-    while let Some(msg_result) = ws_stream.next().await {
-        let msg = msg_result.context("WS message receive error")?;
-
-        match msg {
-            Message::Text(text) => {
-                let combined: BinanceCombinedStreamMsg = match serde_json::from_str(&text) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!(error = %e, "Failed to parse combined stream message; skipping");
-                        continue;
-                    }
-                };
-
-                // Stream name format: "btcusdt@depth5@100ms"
-                let symbol_lower = combined.stream.split('@').next().unwrap_or("").to_string();
-
-                let key = match symbol_to_key.get(&symbol_lower) {
-                    Some(&k) => k,
-                    None => {
-                        warn!(symbol = %symbol_lower, "WS event for untracked symbol; skipping");
-                        continue;
-                    }
-                };
-
-                let event: BinanceWsDepthEvent = match serde_json::from_value(combined.data) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        warn!(error = %e, symbol = %symbol_lower, "Failed to parse depth event");
-                        continue;
-                    }
-                };
-
-                debug!(
-                    symbol = %symbol_lower,
-                    key = ?key,
-                    bids = event.bids.len(),
-                    asks = event.asks.len(),
-                    "Depth WS event received"
-                );
-
-                if let Some(snapshot) = ws_depth_event_to_order_book(&event, key)
-                    && tx.send(OrderBookUpdate { snapshot }).await.is_err()
-                {
-                    // Downstream actor dropped the receiver — shut down cleanly.
-                    info!(url = %url, "WS depth stream receiver dropped; shutting down stream task");
-                    return Ok(());
-                }
-            }
-            Message::Close(frame) => {
-                info!(url = %url, reason = ?frame, "Binance WS depth stream closed by server");
-                return Ok(());
-            }
-            // tungstenite handles Ping/Pong automatically; nothing to do here.
-            _ => {}
-        }
+#[async_trait]
+impl PositionProvider for BinanceClient {
+    async fn fetch_positions(&self) -> Result<Vec<Position>, TradingError> {
+        Err(TradingError::Other(
+            "Binance fetch_positions not implemented yet".to_string(),
+        ))
     }
-
-    info!(url = %url, "Binance WS depth stream ended (stream exhausted)");
-    Ok(())
 }
 
 #[async_trait]
 impl OrderBookFeeder for BinanceClient {
     async fn fetch_order_book(&self, key: InstrumentKey) -> Result<OrderBookSnapshot, PriceError> {
-        let symbol = pairs_to_symbol(key.pair);
+        let instrument = self
+            .registry
+            .get(&key)
+            .ok_or(PriceError::UnsupportedInstrument)?;
+        let symbol = instrument.exchange_symbol;
         let timestamp_ms = Utc::now().timestamp_millis();
 
         debug!(key = ?key, symbol = %symbol, "Fetching REST order-book snapshot");
@@ -658,12 +702,6 @@ impl OrderBookFeeder for BinanceClient {
         keys: Vec<InstrumentKey>,
         tx: mpsc::Sender<OrderBookUpdate>,
     ) -> anyhow::Result<()> {
-        // symbol (lowercase) -> InstrumentKey
-        let symbol_to_key: HashMap<String, InstrumentKey> = keys
-            .iter()
-            .map(|k| (pairs_to_symbol(k.pair).to_lowercase(), *k))
-            .collect();
-
         let futures_keys: Vec<&InstrumentKey> = keys
             .iter()
             .filter(|k| k.instrument_type == InstrumentType::Swap)
@@ -674,54 +712,60 @@ impl OrderBookFeeder for BinanceClient {
             .filter(|k| k.instrument_type == InstrumentType::Spot)
             .collect();
 
-        let futures_handle = if !futures_keys.is_empty() {
-            let streams = futures_keys
-                .iter()
-                .map(|k| format!("{}@depth5@100ms", pairs_to_symbol(k.pair).to_lowercase()))
-                .collect::<Vec<_>>();
-            let stream_list = streams.join("/");
-            let url = format!("{BINANCE_FUTURES_WS_BASE_URL}/stream?streams={stream_list}");
-            info!(streams = ?streams, url = %url, "Subscribing to Binance futures WS depth streams");
-            let map = symbol_to_key.clone();
-            let tx2 = tx.clone();
-            Some(tokio::spawn(
-                async move { stream_ws_depth(url, map, tx2).await },
-            ))
-        } else {
-            None
-        };
+        let cancel = CancellationToken::new();
 
-        let spot_handle = if !spot_keys.is_empty() {
-            let streams = spot_keys
-                .iter()
-                .map(|k| format!("{}@depth5@100ms", pairs_to_symbol(k.pair).to_lowercase()))
-                .collect::<Vec<_>>();
-            let stream_list = streams.join("/");
-            let url = format!("{BINANCE_SPOT_WS_BASE_URL}/stream?streams={stream_list}");
-            info!(streams = ?streams, url = %url, "Subscribing to Binance spot WS depth streams");
-            let map = symbol_to_key.clone();
-            let tx2 = tx.clone();
-            Some(tokio::spawn(
-                async move { stream_ws_depth(url, map, tx2).await },
-            ))
-        } else {
-            None
-        };
+        // Cancel all depth supervisors when the depth channel receiver is dropped.
+        let cancel_on_close = cancel.clone();
+        let tx_watcher = tx.clone();
+        tokio::spawn(async move {
+            tx_watcher.closed().await;
+            cancel_on_close.cancel();
+        });
 
-        // Return as soon as any stream finishes (or errors).
-        match (futures_handle, spot_handle) {
-            (Some(fh), Some(sh)) => {
-                tokio::try_join!(async { fh.await.map_err(anyhow::Error::from)? }, async {
-                    sh.await.map_err(anyhow::Error::from)?
-                },)?;
+        let mut handles = Vec::new();
+
+        if !futures_keys.is_empty() {
+            let mut map = HashMap::new();
+            for k in &futures_keys {
+                if let Some(instrument) = self.registry.get(k) {
+                    let symbol_lower = instrument.exchange_symbol.to_lowercase();
+                    map.insert(symbol_lower, **k);
+                }
             }
-            (Some(fh), None) => {
-                fh.await.map_err(anyhow::Error::from)??;
+            let base_url = if self.config.testnet {
+                BINANCE_FUTURES_WS_TESTNET_URL
+            } else {
+                BINANCE_FUTURES_WS_BASE_URL
             }
-            (None, Some(sh)) => {
-                sh.await.map_err(anyhow::Error::from)??;
+            .to_string();
+
+            let policy = BinanceDepthPolicy::new(base_url, map, tx.clone());
+            handles.push(ws_supervisor_spawn(policy, cancel.clone()));
+            info!("Binance Futures depth supervisor spawned");
+        }
+
+        if !spot_keys.is_empty() {
+            let mut map = HashMap::new();
+            for k in &spot_keys {
+                if let Some(instrument) = self.registry.get(k) {
+                    let symbol_lower = instrument.exchange_symbol.to_lowercase();
+                    map.insert(symbol_lower, **k);
+                }
             }
-            (None, None) => {}
+            let base_url = if self.config.testnet {
+                BINANCE_SPOT_WS_TESTNET_URL
+            } else {
+                BINANCE_SPOT_WS_BASE_URL
+            }
+            .to_string();
+
+            let policy = BinanceDepthPolicy::new(base_url, map, tx.clone());
+            handles.push(ws_supervisor_spawn(policy, cancel.clone()));
+            info!("Binance Spot depth supervisor spawned");
+        }
+
+        for handle in handles {
+            handle.join().await;
         }
 
         Ok(())
@@ -738,7 +782,11 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_client(mock_server: &MockServer, mode: BinanceApiMode) -> BinanceClient {
+    fn test_client(
+        mock_server: &MockServer,
+        mode: BinanceApiMode,
+        registry: InstrumentRegistry,
+    ) -> BinanceClient {
         let config = BinanceConfig {
             mode,
             timeout_secs: 5,
@@ -747,8 +795,9 @@ mod tests {
             api_secret: None,
             futures_base_url: Some(mock_server.uri()),
             spot_base_url: Some(mock_server.uri()),
+            testnet: false,
         };
-        BinanceClient::new(config).expect("Failed to create test client")
+        BinanceClient::new(config, registry).expect("Failed to create test client")
     }
 
     #[tokio::test]
@@ -761,7 +810,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Futures);
+        let client = test_client(&mock_server, BinanceApiMode::Futures, empty_registry());
         let result = client.health_check().await;
 
         assert!(result.is_ok());
@@ -777,7 +826,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Spot);
+        let client = test_client(&mock_server, BinanceApiMode::Spot, empty_registry());
         let result = client.health_check().await;
 
         assert!(result.is_ok());
@@ -793,7 +842,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Futures);
+        let client = test_client(&mock_server, BinanceApiMode::Futures, empty_registry());
         let result = client.server_time().await;
 
         assert!(result.is_ok());
@@ -819,10 +868,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Futures);
         let registry = empty_registry();
+        let client = test_client(&mock_server, BinanceApiMode::Futures, registry.clone());
 
-        let result = client.load_instruments(&registry).await;
+        let result = client.load_instruments().await;
         assert!(result.is_ok());
         assert_eq!(registry.len(), 2);
 
@@ -851,10 +900,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Spot);
         let registry = empty_registry();
+        let client = test_client(&mock_server, BinanceApiMode::Spot, registry.clone());
 
-        let result = client.load_instruments(&registry).await;
+        let result = client.load_instruments().await;
         assert!(result.is_ok());
         assert_eq!(registry.len(), 2);
 
@@ -888,13 +937,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Futures);
         let registry = empty_registry();
+        let client = test_client(&mock_server, BinanceApiMode::Futures, registry.clone());
 
-        client.load_instruments(&registry).await.unwrap();
+        client.load_instruments().await.unwrap();
         assert_eq!(registry.len(), 2);
 
-        client.load_instruments(&registry).await.unwrap();
+        client.load_instruments().await.unwrap();
     }
 
     #[tokio::test]
@@ -909,8 +958,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Futures);
         let registry = test_registry();
+        let client = test_client(&mock_server, BinanceApiMode::Futures, registry.clone());
 
         let key = InstrumentKey {
             exchange: Exchange::Binance,
@@ -918,7 +967,7 @@ mod tests {
             pair: Pairs::BTCUSDT,
         };
 
-        let result = client.funding_rate_snapshot(key, &registry).await;
+        let result = client.funding_rate_snapshot(key).await;
         assert!(result.is_ok());
 
         let snapshot = result.unwrap();
@@ -931,8 +980,8 @@ mod tests {
     #[tokio::test]
     async fn funding_rate_snapshot_rejects_spot() {
         let mock_server = MockServer::start().await;
-        let client = test_client(&mock_server, BinanceApiMode::Futures);
         let registry = test_registry();
+        let client = test_client(&mock_server, BinanceApiMode::Futures, registry.clone());
 
         let key = InstrumentKey {
             exchange: Exchange::Binance,
@@ -940,7 +989,7 @@ mod tests {
             pair: Pairs::BTCUSDT,
         };
 
-        let result = client.funding_rate_snapshot(key, &registry).await;
+        let result = client.funding_rate_snapshot(key).await;
         assert!(matches!(
             result,
             Err(MarketDataError::UnsupportedInstrument)
@@ -959,8 +1008,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = test_client(&mock_server, BinanceApiMode::Futures);
         let registry = test_registry();
+        let client = test_client(&mock_server, BinanceApiMode::Futures, registry.clone());
 
         let key = InstrumentKey {
             exchange: Exchange::Binance,
@@ -971,9 +1020,7 @@ mod tests {
         let start = chrono::Utc::now() - chrono::Duration::days(1);
         let end = chrono::Utc::now();
 
-        let result = client
-            .funding_rate_history(key, start, end, 100, &registry)
-            .await;
+        let result = client.funding_rate_history(key, start, end, 100).await;
         assert!(result.is_ok());
 
         let series = result.unwrap();
@@ -998,7 +1045,7 @@ mod tests {
             mode: BinanceApiMode::Futures,
             ..Default::default()
         };
-        let client = BinanceClient::new(config).unwrap();
+        let client = BinanceClient::new(config, empty_registry()).unwrap();
 
         assert!(client.futures_client().is_ok());
         assert!(client.spot_client().is_err());
@@ -1010,7 +1057,7 @@ mod tests {
             mode: BinanceApiMode::Spot,
             ..Default::default()
         };
-        let client = BinanceClient::new(config).unwrap();
+        let client = BinanceClient::new(config, empty_registry()).unwrap();
 
         assert!(client.futures_client().is_err());
         assert!(client.spot_client().is_ok());
@@ -1019,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn account_snapshot_requires_private_config() {
         let mock_server = MockServer::start().await;
-        let client = test_client(&mock_server, BinanceApiMode::Both);
+        let client = test_client(&mock_server, BinanceApiMode::Both, empty_registry());
 
         let result = client.account_snapshot().await;
         assert!(matches!(result, Err(AccountError::Other(_))));
@@ -1053,8 +1100,10 @@ mod tests {
             api_secret: Some("test-secret".to_string()),
             futures_base_url: Some(mock_server.uri()),
             spot_base_url: Some(mock_server.uri()),
+            testnet: false,
         };
-        let client = BinanceClient::new(config).expect("client should be created");
+        let client =
+            BinanceClient::new(config, empty_registry()).expect("client should be created");
 
         let snapshot = client
             .account_snapshot()

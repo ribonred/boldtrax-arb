@@ -1,0 +1,36 @@
+[alias]
+# Project specific aliases
+wizard = "run -- wizard"
+doctor = "run -- doctor"
+
+# Common shortcuts
+c = "check"
+b = "build"
+r = "run"
+t = "test"
+cl = "clippy --all-targets --all-features -- -D warnings"
+lint = "clippy --all-targets --all-features -- -D warnings"
+
+# Run tests with nextest (if installed: cargo install cargo-nextest)
+nt = "nextest run"
+
+[build]
+# Uncomment to use the mold linker for significantly faster compile times on Linux
+# (Requires mold to be installed: sudo apt install mold)
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.x86_64-unknown-linux-gnu]
+# Uncomment to use the lld linker for faster compile times on Linux
+# (Requires lld to be installed: sudo apt install lld)
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[profile.dev.package."*"]
+# Optimize dependencies even in debug mode. 
+# This makes the bot run much faster during development without slowing down your own code's compile time.
+opt-level = 3
+
+[profile.release]
+# LTO (Link Time Optimization) produces better optimized code at the cost of longer compile times.
+lto = "thin"
+# Strip debug info from the release binary to reduce size.
+strip = "debuginfo"

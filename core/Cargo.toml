@@ -28,6 +28,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strum = { version = "0.26", features = ["derive"] }
 url = "2"
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
 http = "1"
 rkyv = { version = "0.7", default-features = false, features = ["std", "size_32", "validation", "bytecheck"] }
 hmac = "0.12"
@@ -37,6 +39,10 @@ zeromq = "0.5"
 redis = { version = "0.28", features = ["tokio-comp"] }
 bytecheck = "0.6"
 bytes = "1.11.1"
+moka = { version = "0.12.13", features = ["sync"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

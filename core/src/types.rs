@@ -29,7 +29,17 @@ pub enum Currency {
 }
 // instrument types we care about
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
@@ -39,15 +49,29 @@ pub enum InstrumentType {
 }
 // exchange we care about
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumString,
+    Display,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
+#[strum(serialize_all = "lowercase")]
 pub enum Exchange {
     Binance,
     Bybit,
     Gateio,
     Aster,
+    Okx,
 }
 
 impl Exchange {
@@ -57,6 +81,7 @@ impl Exchange {
             Exchange::Bybit => "BY",
             Exchange::Gateio => "GT",
             Exchange::Aster => "AS",
+            Exchange::Okx => "OK",
         }
     }
 }
@@ -145,6 +170,7 @@ impl Default for InstrumentKey {
 pub struct Instrument {
     pub key: InstrumentKey,
     pub exchange_symbol: String,
+    pub exchange_id: String,
     pub tick_size: Decimal,
     pub lot_size: Decimal,
     pub min_notional: Option<Decimal>,
@@ -291,12 +317,25 @@ pub struct OrderBookUpdate {
 }
 
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
 )]
+#[serde(rename_all = "lowercase")]
 #[archive(check_bytes)]
 #[repr(u8)]
 pub enum ExecutionMode {
     Live,
+    #[default]
     Paper,
 }
 
@@ -327,6 +366,7 @@ pub enum OrderType {
 #[archive(check_bytes)]
 #[repr(u8)]
 pub enum OrderStatus {
+    PendingSubmit,
     New,
     PartiallyFilled,
     Filled,
@@ -360,6 +400,51 @@ pub struct Order {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Order {
+    pub fn is_pending_submit(&self) -> bool {
+        self.status == OrderStatus::PendingSubmit
+    }
+
+    pub fn is_pending_or_new(&self) -> bool {
+        self.status == OrderStatus::PendingSubmit || self.status == OrderStatus::New
+    }
+
+    pub fn is_final_state(&self) -> bool {
+        matches!(
+            self.status,
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+        )
+    }
+
+    pub fn mark_new(&mut self) {
+        self.status = OrderStatus::New;
+        self.updated_at = Utc::now();
+    }
+
+    pub fn mark_rejected(&mut self) {
+        self.status = OrderStatus::Rejected;
+        self.updated_at = Utc::now();
+    }
+
+    pub fn mark_canceled(&mut self) {
+        self.status = OrderStatus::Canceled;
+        self.updated_at = Utc::now();
+    }
+
+    /// Applies updates from an exchange order to this internal order.
+    /// This updates the status, filled size, average fill price, and timestamps.
+    pub fn apply_exchange_update(&mut self, exchange_order: &Order) {
+        self.status = exchange_order.status;
+        self.filled_size = exchange_order.filled_size;
+        self.avg_fill_price = exchange_order.avg_fill_price;
+        self.updated_at = exchange_order.updated_at;
+
+        if self.exchange_order_id.is_none() {
+            self.exchange_order_id = exchange_order.exchange_order_id.clone();
+        }
+    }
+}
+
 impl Default for Order {
     fn default() -> Self {
         let now = Utc::now();
@@ -376,7 +461,7 @@ impl Default for Order {
                 price: None,
                 size: Decimal::ZERO,
             },
-            status: OrderStatus::New,
+            status: OrderStatus::PendingSubmit,
             filled_size: Decimal::ZERO,
             avg_fill_price: None,
             created_at: now,
@@ -390,9 +475,44 @@ impl Default for Order {
 #[repr(u8)]
 pub enum OrderEvent {
     New(Order),
+    PartiallyFilled(Order),
     Filled(Order),
     Canceled(Order),
     Rejected(Order),
+}
+
+impl OrderEvent {
+    pub fn inner(&self) -> &Order {
+        match self {
+            OrderEvent::New(o) => o,
+            OrderEvent::PartiallyFilled(o) => o,
+            OrderEvent::Filled(o) => o,
+            OrderEvent::Canceled(o) => o,
+            OrderEvent::Rejected(o) => o,
+        }
+    }
+
+    pub fn into_inner(self) -> Order {
+        match self {
+            OrderEvent::New(o) => o,
+            OrderEvent::PartiallyFilled(o) => o,
+            OrderEvent::Filled(o) => o,
+            OrderEvent::Canceled(o) => o,
+            OrderEvent::Rejected(o) => o,
+        }
+    }
+}
+
+impl From<Order> for OrderEvent {
+    fn from(order: Order) -> Self {
+        match order.status {
+            OrderStatus::PartiallyFilled => OrderEvent::PartiallyFilled(order),
+            OrderStatus::Filled => OrderEvent::Filled(order),
+            OrderStatus::Canceled => OrderEvent::Canceled(order),
+            OrderStatus::Rejected => OrderEvent::Rejected(order),
+            _ => OrderEvent::New(order),
+        }
+    }
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]

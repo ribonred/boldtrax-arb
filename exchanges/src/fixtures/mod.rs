@@ -9,11 +9,10 @@ use boldtrax_core::types::{
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::sync::Arc;
 
 /// Create a test registry pre-populated with common instruments
-pub fn test_registry() -> Arc<InstrumentRegistry> {
-    let registry = Arc::new(InstrumentRegistry::new());
+pub fn test_registry() -> InstrumentRegistry {
+    let registry = InstrumentRegistry::new();
 
     registry.insert(btcusdt_swap());
     registry.insert(ethusdt_swap());
@@ -22,8 +21,8 @@ pub fn test_registry() -> Arc<InstrumentRegistry> {
     registry
 }
 
-pub fn empty_registry() -> Arc<InstrumentRegistry> {
-    Arc::new(InstrumentRegistry::new())
+pub fn empty_registry() -> InstrumentRegistry {
+    InstrumentRegistry::new()
 }
 
 pub mod binance {
@@ -223,6 +222,7 @@ pub fn btcusdt_swap() -> Instrument {
         contract_size: Some(Decimal::ONE),
         multiplier: Decimal::ONE,
         funding_interval: Some(FundingInterval::Every8Hours),
+        exchange_id: "BTCUSDT".to_string(),
     }
 }
 
@@ -241,6 +241,7 @@ pub fn ethusdt_swap() -> Instrument {
         contract_size: Some(Decimal::ONE),
         multiplier: Decimal::ONE,
         funding_interval: Some(FundingInterval::Every8Hours),
+        exchange_id: "ETHUSDT".to_string(),
     }
 }
 
@@ -259,5 +260,6 @@ pub fn btcusdt_spot() -> Instrument {
         contract_size: None,
         multiplier: Decimal::ONE,
         funding_interval: None,
+        exchange_id: "BTCUSDT".to_string(),
     }
 }
