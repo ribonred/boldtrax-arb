@@ -1,4 +1,5 @@
-use crate::types::{Exchange, InstrumentKey, Order, OrderRequest, Position};
+use crate::AccountSnapshot;
+use crate::types::{Exchange, Instrument, InstrumentKey, Order, OrderRequest, Position};
 use crate::zmq::discovery::{DiscoveryClient, ServiceType};
 use crate::zmq::protocol::{ZmqCommand, ZmqEvent, ZmqResponse};
 use anyhow::{Context, Result};
@@ -10,6 +11,14 @@ use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage
 
 pub struct ZmqClient {
     dealer: DealerSocket,
+    sub: SubSocket,
+}
+
+pub struct ZmqCommandClient {
+    dealer: DealerSocket,
+}
+
+pub struct ZmqEventSubscriber {
     sub: SubSocket,
 }
 
@@ -47,6 +56,17 @@ impl ZmqClient {
         Ok(Self { dealer, sub })
     }
 
+    pub fn split(self) -> (ZmqCommandClient, ZmqEventSubscriber) {
+        (
+            ZmqCommandClient {
+                dealer: self.dealer,
+            },
+            ZmqEventSubscriber { sub: self.sub },
+        )
+    }
+}
+
+impl ZmqCommandClient {
     pub async fn submit_order(&mut self, req: OrderRequest) -> Result<Order> {
         let response = self.send_command(ZmqCommand::SubmitOrder(req)).await?;
         match response {
@@ -83,6 +103,33 @@ impl ZmqClient {
         }
     }
 
+    pub async fn get_account_snapshot(&mut self) -> Result<AccountSnapshot> {
+        let response = self.send_command(ZmqCommand::GetAccountSnapshot).await?;
+        match response {
+            ZmqResponse::AccountSnapshot(snapshot) => Ok(snapshot),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    pub async fn get_instrument(&mut self, key: InstrumentKey) -> Result<Option<Instrument>> {
+        let response = self.send_command(ZmqCommand::GetInstrument(key)).await?;
+        match response {
+            ZmqResponse::Instrument(instrument) => Ok(instrument),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    pub async fn get_all_instruments(&mut self) -> Result<Vec<Instrument>> {
+        let response = self.send_command(ZmqCommand::GetAllInstruments).await?;
+        match response {
+            ZmqResponse::AllInstruments(instruments) => Ok(instruments),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
     async fn send_command(&mut self, command: ZmqCommand) -> Result<ZmqResponse> {
         let payload = rkyv::to_bytes::<_, 1024>(&command).unwrap();
 
@@ -102,13 +149,21 @@ impl ZmqClient {
         }
 
         let payload_bytes = response_msg.get(1).unwrap();
-        let archived = rkyv::check_archived_root::<ZmqResponse>(payload_bytes)
+        
+        // Ensure the payload is properly aligned for rkyv
+        // rkyv requires 8-byte alignment for some types
+        let mut aligned_payload = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+        aligned_payload.extend_from_slice(payload_bytes);
+
+        let archived = rkyv::check_archived_root::<ZmqResponse>(&aligned_payload)
             .map_err(|e| anyhow::anyhow!("Failed to validate response payload: {}", e))?;
 
         let response: ZmqResponse = archived.deserialize(&mut Infallible).unwrap();
         Ok(response)
     }
+}
 
+impl ZmqEventSubscriber {
     pub fn spawn_event_listener(
         mut self,
         tx: mpsc::Sender<ZmqEvent>,
@@ -123,7 +178,13 @@ impl ZmqClient {
                         }
 
                         let payload_bytes = msg.get(1).unwrap();
-                        let archived = match rkyv::check_archived_root::<ZmqEvent>(payload_bytes) {
+                        
+                        // Ensure the payload is properly aligned for rkyv
+                        // rkyv requires 8-byte alignment for some types
+                        let mut aligned_payload = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+                        aligned_payload.extend_from_slice(payload_bytes);
+
+                        let archived = match rkyv::check_archived_root::<ZmqEvent>(&aligned_payload) {
                             Ok(a) => a,
                             Err(e) => {
                                 error!(error = %e, "Failed to validate event payload");

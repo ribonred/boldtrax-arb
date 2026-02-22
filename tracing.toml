@@ -1,0 +1,77 @@
+title = "Boldtrax Bot Tracing Configuration"
+
+# ─── Layers ───────────────────────────────────────────────────────────────────
+
+[layer.console]
+type    = "fmt"
+writer  = "stdout"
+formatter  = "compact"
+span_events = "none"
+ansi    = true
+
+[layer.log-file]
+type        = "fmt"
+writer      = "file-writer"
+formatter   = "full"
+span_events = "active"
+ansi        = false
+
+# ─── Writers ──────────────────────────────────────────────────────────────────
+
+[writer.stdout]
+type = "standard_output"
+
+[writer.file-writer]
+type           = "file"
+directory_path = "./logs"
+file_name      = "boldtrax"
+file_ext       = "log"
+max_log_files  = 7
+rotation       = "daily"
+non_blocking   = true
+lossy          = true         # okay — file has the authoritative copy
+
+# ─── Filter ───────────────────────────────────────────────────────────────────
+#
+# Root level applies to everything not matched by a directive.
+# Directives follow the same syntax as RUST_LOG / EnvFilter:
+#   "crate=level", "crate::module=level"
+#
+# ── To silence a noisy crate while keeping your code verbose:
+#      add  "noisy_crate=warn"  under directives.
+#
+# ── To turn on trace for a single module during a debugging session:
+#      change  "exchanges=debug"  to  "exchanges=trace"  (no recompile needed).
+
+[filter.root]
+level = "info"
+directives = [
+    # ── Application crates ────────────────────────────────────────────────────
+    "boldtrax_core=debug",
+    "exchanges=debug",
+    "boldtrax_bot=debug",
+    "boldtrax_core::manager::price=info",
+
+    # ── Fine-grained per-module overrides ────────────────────────────────────
+    # Uncomment to increase verbosity for a specific module:
+    # "exchanges::binance::ws=trace",
+    # "boldtrax_core::ws::supervisor=trace",
+    # "boldtrax_core::manager=trace",
+
+    # ── Silence noisy third-party crates ─────────────────────────────────────
+    "tokio=warn",
+    "tokio_util=warn",
+    "hyper=warn",
+    "hyper_util=warn",
+    "h2=warn",
+    "reqwest=warn",
+    "reqwest_middleware=warn",
+    "reqwest_retry=warn",
+    "rustls=warn",
+    "tungstenite=warn",
+    "tokio_tungstenite=warn",
+    "mio=warn",
+    "want=warn",
+    "redis=warn",
+    "zeromq=warn",
+]

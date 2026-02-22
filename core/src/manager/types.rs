@@ -1,7 +1,21 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-use crate::types::{Currency, Exchange};
+use crate::types::{Currency, Exchange, InstrumentKey};
+
+/// Carries the real-time position fields emitted by a WebSocket `ACCOUNT_UPDATE`
+/// event.  Only fields the WS stream knows about are included; REST-owned fields
+/// (`liquidation_price`, `leverage`) are intentionally absent so the
+/// `PositionManagerActor` can preserve them across WS events.
+///
+/// A `size` of zero signals that the position was closed.
+#[derive(Debug, Clone)]
+pub struct WsPositionPatch {
+    pub key: InstrumentKey,
+    pub size: Decimal,
+    pub entry_price: Decimal,
+    pub unrealized_pnl: Decimal,
+}
 
 #[derive(
     rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,

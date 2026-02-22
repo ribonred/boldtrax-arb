@@ -2,13 +2,13 @@ mod cli;
 mod runner;
 
 use boldtrax_core::config::types::{AppConfig, ExchangeConfig};
+use boldtrax_core::manager::account::AccountManagerConfig;
 use boldtrax_core::manager::price::PriceManagerConfig;
 use boldtrax_core::order::OrderManagerConfig;
 use boldtrax_core::position::PositionManagerConfig;
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::types::{Exchange, ExecutionMode, InstrumentKey, InstrumentType, Pairs};
 use boldtrax_core::zmq::server::ZmqServerConfig;
-use boldtrax_core::{logger::init_logger, manager::account::AccountManagerConfig};
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
 use exchanges::binance::{BinanceClient, BinanceConfig};
@@ -34,7 +34,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
-    let _logguard = init_logger();
+    tracing_config::init!();
 
     let cli = Cli::parse();
 

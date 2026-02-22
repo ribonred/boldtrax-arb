@@ -202,10 +202,6 @@ pub trait FundingRateMarketData: MarketDataProvider {
     ) -> Result<FundingRateSeries, MarketDataError>;
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Trading / Execution errors and traits
-// ──────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Error)]
 pub enum TradingError {
     #[error("insufficient balance: required {required}, available {available}")]
@@ -252,6 +248,19 @@ impl From<crate::http::ClientError> for TradingError {
             ClientError::InvalidResponse(e) => TradingError::Parse(e),
             ClientError::Unauthorized => TradingError::Other("unauthorized".to_string()),
             ClientError::AuthError(e) => TradingError::Other(format!("auth error: {}", e)),
+        }
+    }
+}
+
+impl From<AccountError> for TradingError {
+    fn from(err: AccountError) -> Self {
+        match err {
+            AccountError::Unauthorized => TradingError::Other("unauthorized".to_string()),
+            AccountError::RateLimited => TradingError::RateLimited,
+            AccountError::Network(e) => TradingError::Network(e),
+            AccountError::Parse(e) => TradingError::Parse(e),
+            AccountError::UnsupportedExchange(e) => TradingError::Other(e),
+            AccountError::Other(e) => TradingError::Other(e),
         }
     }
 }
@@ -338,12 +347,32 @@ impl<T: OrderExecutionProvider + Send + Sync> OrderExecutionProvider for std::sy
 
 #[async_trait]
 pub trait PositionProvider: Send + Sync {
+    /// Fetch current derivative positions via REST (Swap only).
     async fn fetch_positions(&self) -> Result<Vec<crate::types::Position>, TradingError>;
+
+    /// Stream real-time derivative position updates from the exchange WebSocket
+    /// user-data stream.  Blocks until the stream closes; reconnect logic lives
+    /// in the caller.  The default implementation blocks forever — exchanges
+    /// without real-time position streaming are silently idle until REST
+    /// reconciliation runs.
+    async fn stream_position_updates(
+        &self,
+        _tx: mpsc::Sender<crate::manager::types::WsPositionPatch>,
+    ) -> Result<(), AccountError> {
+        std::future::pending().await
+    }
 }
 
 #[async_trait]
 impl<T: PositionProvider + Send + Sync> PositionProvider for std::sync::Arc<T> {
     async fn fetch_positions(&self) -> Result<Vec<crate::types::Position>, TradingError> {
         self.as_ref().fetch_positions().await
+    }
+
+    async fn stream_position_updates(
+        &self,
+        tx: mpsc::Sender<crate::manager::types::WsPositionPatch>,
+    ) -> Result<(), AccountError> {
+        self.as_ref().stream_position_updates(tx).await
     }
 }

@@ -198,7 +198,6 @@ where
         // ── 5. Spawn position manager actor
         let position_handle: PositionManagerHandle = PositionManagerActor::spawn(
             Arc::clone(&self.client),
-            order_handle.subscribe_events(),
             self.config.position_manager_config.clone(),
         );
         info!(exchange = ?self.config.exchange, "PositionManagerActor spawned");

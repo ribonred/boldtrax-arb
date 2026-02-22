@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::Signed;
-use strum::{Display, EnumString};
+use strum::{Display, EnumProperty, EnumString};
 
 // currency we care about
 #[derive(
@@ -40,9 +40,12 @@ pub enum Currency {
     Hash,
     PartialOrd,
     Ord,
+    EnumString,
+    Display,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
+#[strum(serialize_all = "lowercase")]
 pub enum InstrumentType {
     Spot,
     Swap,
@@ -62,36 +65,46 @@ pub enum InstrumentType {
     Hash,
     EnumString,
     Display,
+    EnumProperty,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
-#[strum(serialize_all = "lowercase")]
 pub enum Exchange {
+    #[strum(to_string = "binance", serialize = "BN", props(short_code = "BN"))]
     Binance,
+    #[strum(to_string = "bybit", serialize = "BY", props(short_code = "BY"))]
     Bybit,
+    #[strum(to_string = "gateio", serialize = "GT", props(short_code = "GT"))]
     Gateio,
+    #[strum(to_string = "aster", serialize = "AS", props(short_code = "AS"))]
     Aster,
+    #[strum(to_string = "okx", serialize = "OK", props(short_code = "OK"))]
     Okx,
 }
 
 impl Exchange {
     pub fn short_code(&self) -> &'static str {
-        match self {
-            Exchange::Binance => "BN",
-            Exchange::Bybit => "BY",
-            Exchange::Gateio => "GT",
-            Exchange::Aster => "AS",
-            Exchange::Okx => "OK",
-        }
+        self.get_str("short_code").unwrap_or("UNKNOWN")
     }
 }
 
 // list of pairs we care about
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumString,
+    Display,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
+#[strum(serialize_all = "UPPERCASE")]
 pub enum Pairs {
     BTCUSDT,
     ETHUSDT,
@@ -165,6 +178,48 @@ impl Default for InstrumentKey {
     }
 }
 
+impl std::fmt::Display for InstrumentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}-{}-{}",
+            self.pair,
+            self.exchange.short_code(),
+            self.instrument_type.to_string().to_uppercase()
+        )
+    }
+}
+
+impl std::str::FromStr for InstrumentKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 {
+            return Err(format!("Invalid InstrumentKey format: {}", s));
+        }
+
+        let pair = parts[0]
+            .parse::<Pairs>()
+            .map_err(|_| format!("Invalid pair: {}", parts[0]))?;
+
+        let exchange = parts[1]
+            .parse::<Exchange>()
+            .map_err(|_| format!("Invalid exchange short code: {}", parts[1]))?;
+
+        let instrument_type = parts[2]
+            .to_lowercase()
+            .parse::<InstrumentType>()
+            .map_err(|_| format!("Invalid instrument type: {}", parts[2]))?;
+
+        Ok(Self {
+            exchange,
+            pair,
+            instrument_type,
+        })
+    }
+}
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct Instrument {
@@ -182,12 +237,12 @@ pub struct Instrument {
 impl Instrument {
     pub fn normalize_price(&self, price: Decimal) -> Decimal {
         let price_steps = (price / self.tick_size).round();
-        price_steps * self.tick_size
+        (price_steps * self.tick_size).normalize()
     }
 
     pub fn normalize_quantity(&self, quantity: Decimal) -> Decimal {
         let qty_steps = (quantity / self.lot_size).floor();
-        qty_steps * self.lot_size
+        (qty_steps * self.lot_size).normalize()
     }
 
     pub fn is_notional_valid(&self, price: Decimal, quantity: Decimal) -> bool {
@@ -340,20 +395,42 @@ pub enum ExecutionMode {
 }
 
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumString,
+    Display,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
+#[strum(serialize_all = "lowercase")]
 pub enum OrderSide {
     Buy,
     Sell,
 }
 
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumString,
+    Display,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
+#[strum(serialize_all = "lowercase")]
 pub enum OrderType {
     Market,
     Limit,
@@ -361,7 +438,16 @@ pub enum OrderType {
 }
 
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    strum::Display,
 )]
 #[archive(check_bytes)]
 #[repr(u8)]
@@ -555,5 +641,42 @@ impl Position {
         }
 
         self.size = new_size;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_instrument_key_display_and_parse() {
+        let key = InstrumentKey {
+            exchange: Exchange::Binance,
+            pair: Pairs::BTCUSDT,
+            instrument_type: InstrumentType::Swap,
+        };
+
+        let key_str = key.to_string();
+        assert_eq!(key_str, "BTCUSDT-BN-SWAP");
+
+        let parsed_key = InstrumentKey::from_str(&key_str).unwrap();
+        assert_eq!(parsed_key, key);
+    }
+
+    #[test]
+    fn test_instrument_key_parse_invalid() {
+        assert!(InstrumentKey::from_str("BTCUSDT-BN").is_err());
+        assert!(InstrumentKey::from_str("INVALID-BN-SWAP").is_err());
+        assert!(InstrumentKey::from_str("BTCUSDT-INVALID-SWAP").is_err());
+        assert!(InstrumentKey::from_str("BTCUSDT-BN-INVALID").is_err());
+    }
+
+    #[test]
+    fn test_exchange_strum_properties() {
+        assert_eq!(Exchange::Binance.short_code(), "BN");
+        assert_eq!(Exchange::Binance.to_string(), "binance");
+        assert_eq!(Exchange::from_str("BN").unwrap(), Exchange::Binance);
+        assert_eq!(Exchange::from_str("binance").unwrap(), Exchange::Binance);
     }
 }

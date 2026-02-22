@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use boldtrax_core::http::TracedHttpClient;
+use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::types::{Exchange, InstrumentKey, InstrumentType, OrderBookUpdate, OrderEvent};
 use boldtrax_core::utils::hmac_sha256_hex;
@@ -21,11 +22,12 @@ use boldtrax_core::ws::policy::WsStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::binance::mappers::{
     futures_execution_to_order_event, spot_execution_to_order_event, ws_depth_event_to_order_book,
+    ws_position_to_patch,
 };
 use crate::binance::types::{
     BinanceCombinedStreamMsg, BinanceFuturesUserDataEvent, BinanceSpotUserDataEvent,
@@ -108,7 +110,7 @@ impl WsPolicy for BinanceDepthPolicy {
             }
         };
 
-        debug!(
+        trace!(
             symbol = %symbol_lower,
             bids = event.bids.len(),
             asks = event.asks.len(),
@@ -139,6 +141,9 @@ impl WsPolicy for BinanceDepthPolicy {
 
 /// WebSocket policy for the Binance **Futures** user-data stream.
 ///
+/// Handles both `ORDER_TRADE_UPDATE` (order executions) and `ACCOUNT_UPDATE`
+/// (real-time position changes) from the same listen-key stream.
+///
 /// ### Lifecycle
 /// - **`prepare()`**: POSTs `/fapi/v1/listenKey` to obtain a fresh key and
 ///   embeds it in `wss://fstream.binance.com/ws/<key>`.
@@ -151,10 +156,14 @@ pub struct BinanceFuturesUserDataPolicy {
     base_ws_url: String,
     listen_key: String,
     registry: InstrumentRegistry,
-    tx: mpsc::Sender<OrderEvent>,
+    /// Order execution sink — `None` when used purely for position streaming.
+    order_tx: Option<mpsc::Sender<OrderEvent>>,
+    /// Position update sink — `None` when used purely for order execution streaming.
+    pos_tx: Option<mpsc::Sender<WsPositionPatch>>,
 }
 
 impl BinanceFuturesUserDataPolicy {
+    /// Primary constructor for order execution streaming (used by `stream_executions`).
     pub fn new(
         client: TracedHttpClient,
         base_ws_url: String,
@@ -166,7 +175,25 @@ impl BinanceFuturesUserDataPolicy {
             base_ws_url,
             listen_key: String::new(),
             registry,
-            tx,
+            order_tx: Some(tx),
+            pos_tx: None,
+        }
+    }
+
+    /// Constructor for position-only streaming (used by `stream_position_updates`).
+    pub fn new_for_positions(
+        client: TracedHttpClient,
+        base_ws_url: String,
+        registry: InstrumentRegistry,
+        pos_tx: mpsc::Sender<WsPositionPatch>,
+    ) -> Self {
+        Self {
+            client,
+            base_ws_url,
+            listen_key: String::new(),
+            registry,
+            order_tx: None,
+            pos_tx: Some(pos_tx),
         }
     }
 }
@@ -176,7 +203,7 @@ impl WsPolicy for BinanceFuturesUserDataPolicy {
     async fn prepare(&mut self) -> anyhow::Result<String> {
         let response = self
             .client
-            .post("/fapi/v1/listenKey", &serde_json::json!({}))
+            .post_empty("/fapi/v1/listenKey")
             .await?;
         let data: crate::binance::types::BinanceListenKeyResponse = response
             .json()
@@ -197,7 +224,7 @@ impl WsPolicy for BinanceFuturesUserDataPolicy {
         _sink: &mut futures_util::stream::SplitSink<WsStream, Message>,
     ) -> anyhow::Result<()> {
         let path = format!("/fapi/v1/listenKey?listenKey={}", self.listen_key);
-        let result = self.client.put(&path, &serde_json::json!({})).await;
+        let result = self.client.put_empty(&path).await;
 
         match result {
             Ok(_) => {
@@ -228,31 +255,64 @@ impl WsPolicy for BinanceFuturesUserDataPolicy {
 
         match serde_json::from_str::<BinanceFuturesUserDataEvent>(&text) {
             Ok(BinanceFuturesUserDataEvent::OrderTradeUpdate { order: report }) => {
-                info!(
-                    symbol = %report.symbol,
-                    client_order_id = %report.client_order_id,
-                    side = %report.side,
-                    order_type = %report.order_type,
-                    order_status = %report.order_status,
-                    filled_qty = %report.order_filled_accumulated_quantity,
-                    avg_price = %report.average_price,
-                    "Futures ORDER_TRADE_UPDATE received"
-                );
-                if let Some(event) = self
-                    .registry
-                    .get_by_exchange_symbol(Exchange::Binance, &report.symbol, InstrumentType::Swap)
-                    .and_then(|inst| futures_execution_to_order_event(&report, inst.key))
-                {
-                    if self.tx.send(event).await.is_err() {
-                        return Err(anyhow::anyhow!("futures execution channel closed"));
+                if let Some(ref tx) = self.order_tx {
+                    info!(
+                        symbol = %report.symbol,
+                        client_order_id = %report.client_order_id,
+                        side = %report.side,
+                        order_type = %report.order_type,
+                        order_status = %report.order_status,
+                        filled_qty = %report.order_filled_accumulated_quantity,
+                        avg_price = %report.average_price,
+                        "Futures ORDER_TRADE_UPDATE received"
+                    );
+                    if let Some(event) = self
+                        .registry
+                        .get_by_exchange_symbol(
+                            Exchange::Binance,
+                            &report.symbol,
+                            InstrumentType::Swap,
+                        )
+                        .and_then(|inst| futures_execution_to_order_event(&report, inst.key))
+                    {
+                        if tx.send(event).await.is_err() {
+                            return Err(anyhow::anyhow!("futures execution channel closed"));
+                        }
+                    } else {
+                        warn!(symbol = %report.symbol, "Futures execution for untracked symbol or parse failed");
                     }
-                } else {
-                    warn!(symbol = %report.symbol, "Futures execution for untracked symbol or parse failed");
                 }
             }
-            Ok(BinanceFuturesUserDataEvent::Other) => {
-                // ACCOUNT_UPDATE, MARGIN_CALL, etc. — not handled yet
+            Ok(BinanceFuturesUserDataEvent::AccountUpdate { update }) => {
+                if let Some(ref tx) = self.pos_tx {
+                    for ws_pos in &update.positions {
+                        if let Some(instrument) = self.registry.get_by_exchange_symbol(
+                            Exchange::Binance,
+                            &ws_pos.symbol,
+                            InstrumentType::Swap,
+                        ) {
+                            match ws_position_to_patch(ws_pos, instrument.key) {
+                                Some(patch) => {
+                                    debug!(
+                                        symbol = %ws_pos.symbol,
+                                        size = %patch.size,
+                                        entry_price = %patch.entry_price,
+                                        unrealized_pnl = %patch.unrealized_pnl,
+                                        "ACCOUNT_UPDATE position patch"
+                                    );
+                                    if tx.send(patch).await.is_err() {
+                                        return Err(anyhow::anyhow!("position channel closed"));
+                                    }
+                                }
+                                None => {
+                                    warn!(symbol = %ws_pos.symbol, "Failed to parse ACCOUNT_UPDATE position fields");
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            Ok(BinanceFuturesUserDataEvent::Other) => {}
             Err(e) => {
                 warn!(error = %e, text = %text, "Failed to parse futures user-data event");
             }

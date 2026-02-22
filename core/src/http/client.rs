@@ -120,6 +120,21 @@ impl TracedHttpClient {
         self.handle_response(response).await
     }
 
+    #[instrument(skip(self), fields(method = "POST", url = %path))]
+    pub async fn post_empty(&self, path: &str) -> ClientResult<Response> {
+        let url = self.build_url(path)?;
+        debug!("Sending empty POST request to {}", url);
+
+        let response = self
+            .client
+            .post(url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
     /// Perform PUT request with JSON body
     #[instrument(skip(self, body), fields(method = "PUT", url = %path))]
     pub async fn put<T: Serialize>(&self, path: &str, body: &T) -> ClientResult<Response> {
@@ -134,6 +149,21 @@ impl TracedHttpClient {
             .put(url)
             .header("content-type", "application/json")
             .body(json_body)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    #[instrument(skip(self), fields(method = "PUT", url = %path))]
+    pub async fn put_empty(&self, path: &str) -> ClientResult<Response> {
+        let url = self.build_url(path)?;
+        debug!("Sending empty PUT request to {}", url);
+
+        let response = self
+            .client
+            .put(url)
+            .header("content-type", "application/x-www-form-urlencoded")
             .send()
             .await?;
 

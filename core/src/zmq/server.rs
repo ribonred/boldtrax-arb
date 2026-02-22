@@ -99,7 +99,7 @@ impl ZmqServer {
                         let topic = zmq_event.topic();
                         let payload = rkyv::to_bytes::<_, 1024>(&zmq_event).unwrap();
 
-                        let mut msg = ZmqMessage::from(topic);
+                        let mut msg = ZmqMessage::from(topic.into_bytes());
                         msg.push_back(payload.into_vec().into());
 
                         let mut socket = pub_clone.lock().await;
@@ -132,9 +132,14 @@ impl ZmqServer {
                     let identity = msg.get(0).unwrap().clone();
                     let payload_bytes = msg.get(2).unwrap();
 
+                    // Ensure the payload is properly aligned for rkyv
+                    // rkyv requires 8-byte alignment for some types
+                    let mut aligned_payload = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+                    aligned_payload.extend_from_slice(payload_bytes);
+
                     // Deserialize command
                     let command_result =
-                        match rkyv::check_archived_root::<ZmqCommand>(payload_bytes) {
+                        match rkyv::check_archived_root::<ZmqCommand>(&aligned_payload) {
                             Ok(a) => Ok(a.deserialize(&mut Infallible).unwrap()),
                             Err(e) => Err(format!("Failed to validate rkyv payload: {:?}", e)),
                         };

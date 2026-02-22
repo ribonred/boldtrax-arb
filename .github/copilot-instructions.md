@@ -254,8 +254,7 @@ When I ask you to add a new exchange:
 - Don't use `anyhow` for critical errors that need specific handling
 - Don't use custom error enums for simple retryable network errors
 - Don't use fullpath imports
-- Don't import inside functions, structs, or enums
-- Don't use `std::collections::HashSet` instead of `use std::collections::HashSet;`
+- Don't import inside functions, structs, or enums use `std::collections::HashSet` instead of `use std::collections::HashSet;`
 
 ### Testing Approach
 - Write unit tests for type conversions
@@ -276,3 +275,13 @@ When suggesting code, prioritize maintainability and extensibility over cleverne
 
 ## current architectural diagram
 [diagram.md](./diagram.md)
+
+
+## project goals
+1. Build a robust, modular architecture that supports multiple exchanges with minimal code duplication
+2. Implement a comprehensive risk management framework with configurable parameters
+3. Enable seamless switching between live and paper trading modes for testing and validation
+4. Ensure consistent error handling with explicit enums for critical paths and anyhow for retryable errors
+5. Create a unified type system for all exchange interactions to simplify integration and reduce bugs
+6. create different strategies. future Vs Spot, future Vs future, delta neutral, volatility based, etc
+7. must have internal api to query current positions, funding rates, execution, market data to support strategy, Risk management, data lake and quantitative trading research

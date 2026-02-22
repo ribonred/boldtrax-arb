@@ -409,10 +409,13 @@ where
             if let Some(id) = self.client_id_map.get(&exchange_order.client_order_id) {
                 id.clone()
             } else {
-                panic!(
-                    "FATAL: Received WS event for unknown order (client_order_id: {}). Executing orders outside the strategy is fatal.",
-                    exchange_order.client_order_id
+                error!(
+                    client_order_id = %exchange_order.client_order_id,
+                    key = ?exchange_order.request.key,
+                    status = %exchange_order.status,
+                    "FATAL: WS event for unknown client_order_id — order placed outside strategy"
                 );
+                std::process::abort();
             }
         } else {
             exchange_order.internal_id.clone()
@@ -422,10 +425,14 @@ where
         let mut internal_order = if let Some(order) = self.active_orders.get(&internal_id) {
             order.clone()
         } else {
-            panic!(
-                "FATAL: Received WS event for untracked order (internal_id: {}, client_order_id: {}). Order state lost or executed outside strategy.",
-                internal_id, exchange_order.client_order_id
+            error!(
+                internal_id = %internal_id,
+                client_order_id = %exchange_order.client_order_id,
+                key = ?exchange_order.request.key,
+                status = %exchange_order.status,
+                "FATAL: WS event for untracked order — state lost or order executed outside strategy"
             );
+            std::process::abort();
         };
 
         // Mutate internal order with exchange order data

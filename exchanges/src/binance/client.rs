@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use boldtrax_core::http::{BinanceHmacAuth, HttpClientBuilder, TracedHttpClient};
 use boldtrax_core::manager::account::{AccountManagerError, AccountSnapshotSource};
+use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
     Account, AccountError, BaseInstrumentMeta, FundingRateMarketData, MarketDataError,
@@ -11,10 +12,11 @@ use boldtrax_core::traits::{
 };
 use boldtrax_core::types::{
     FundingInterval, FundingRateSeries, FundingRateSnapshot, Instrument, InstrumentKey,
-    InstrumentType, Order, OrderBookSnapshot, OrderBookUpdate, OrderRequest,
+    InstrumentType, Order, OrderBookSnapshot, OrderBookUpdate, OrderRequest, OrderSide, OrderType,
+    Position,
 };
 use boldtrax_core::ws::{CancellationToken, ws_supervisor_spawn};
-use boldtrax_core::{AccountSnapshot, Exchange, OrderEvent, Position};
+use boldtrax_core::{AccountSnapshot, Exchange, OrderEvent};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio::sync::{OnceCell, mpsc};
@@ -25,14 +27,15 @@ use crate::binance::ws::{
 };
 
 use crate::binance::mappers::{
+    binance_order_response_to_order, binance_position_risk_to_position,
     build_segmented_account_snapshot, funding_history_to_series, ms_to_datetime,
     partial_depth_to_order_book, premium_index_to_snapshot,
 };
 use crate::binance::types::{
     BinanceFundingInfo, BinanceFundingRateHistory, BinanceFuturesBalance,
-    BinanceFuturesExchangeInfo, BinancePartialDepth, BinancePremiumIndex, BinanceServerTime,
-    BinanceSpotAccount, BinanceSpotBalance, BinanceSpotExchangeInfo, BinanceSpotMeta,
-    BinanceSwapMeta,
+    BinanceFuturesExchangeInfo, BinanceFuturesPositionRisk, BinanceOrderResponse,
+    BinancePartialDepth, BinancePremiumIndex, BinanceServerTime, BinanceSpotAccount,
+    BinanceSpotBalance, BinanceSpotExchangeInfo, BinanceSpotMeta, BinanceSwapMeta,
 };
 
 use boldtrax_core::config::types::ExchangeConfig;
@@ -523,38 +526,197 @@ impl OrderExecutionProvider for BinanceClient {
 
     async fn place_order(
         &self,
-        _request: OrderRequest,
-        _client_order_id: String,
+        request: OrderRequest,
+        client_order_id: String,
     ) -> Result<Order, TradingError> {
-        Err(TradingError::Other(
-            "Binance place_order not implemented yet".to_string(),
-        ))
+        let instrument = self
+            .registry
+            .get(&request.key)
+            .ok_or(TradingError::UnsupportedInstrument)?;
+
+        let symbol = instrument.exchange_symbol.clone();
+        let side = match request.side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        };
+        // LIMIT_MAKER is Binance's post-only order type.
+        let (order_type, time_in_force) = match request.order_type {
+            OrderType::Market => ("MARKET", None),
+            OrderType::Limit => ("LIMIT", Some("GTC")),
+            OrderType::PostOnly => ("LIMIT_MAKER", None),
+        };
+
+        let size = instrument.normalize_quantity(request.size);
+
+        let mut params = format!(
+            "symbol={symbol}&side={side}&type={order_type}&quantity={size}&newClientOrderId={client_order_id}",
+        );
+
+        if let Some(price) = request.price {
+            let price = instrument.normalize_price(price);
+            params.push_str(&format!("&price={price}"));
+        }
+
+        if let Some(tif) = time_in_force {
+            params.push_str(&format!("&timeInForce={tif}"));
+        }
+
+        let key = request.key;
+        let strategy_id = request.strategy_id.clone();
+
+        match key.instrument_type {
+            InstrumentType::Swap => {
+                let client = self.futures_private_client()?;
+                let path = format!("/fapi/v1/order?{params}");
+                debug!(symbol = %symbol, side = side, order_type = order_type, "Placing Futures order");
+                let resp = client.post_empty(&path).await.map_err(TradingError::from)?;
+                let order_resp: BinanceOrderResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                binance_order_response_to_order(&order_resp, key, &strategy_id, &client_order_id)
+                    .ok_or_else(|| {
+                        TradingError::Parse(
+                            "failed to parse futures place_order response".to_string(),
+                        )
+                    })
+            }
+            InstrumentType::Spot => {
+                let client = self.spot_private_client()?;
+                let path = format!("/api/v3/order?{params}");
+                debug!(symbol = %symbol, side = side, order_type = order_type, "Placing Spot order");
+                let resp = client.post_empty(&path).await.map_err(TradingError::from)?;
+                let order_resp: BinanceOrderResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                binance_order_response_to_order(&order_resp, key, &strategy_id, &client_order_id)
+                    .ok_or_else(|| {
+                        TradingError::Parse("failed to parse spot place_order response".to_string())
+                    })
+            }
+        }
     }
 
     async fn cancel_order(
         &self,
-        _key: InstrumentKey,
-        _order_id: &str,
+        key: InstrumentKey,
+        order_id: &str,
     ) -> Result<Order, TradingError> {
-        Err(TradingError::Other(
-            "Binance cancel_order not implemented yet".to_string(),
-        ))
+        let instrument = self
+            .registry
+            .get(&key)
+            .ok_or(TradingError::UnsupportedInstrument)?;
+        let symbol = instrument.exchange_symbol;
+
+        match key.instrument_type {
+            InstrumentType::Swap => {
+                let client = self.futures_private_client()?;
+                let path = format!("/fapi/v1/order?symbol={symbol}&origClientOrderId={order_id}");
+                debug!(symbol = %symbol, order_id = order_id, "Canceling Futures order");
+                let resp = client.delete(&path).await.map_err(TradingError::from)?;
+                let order_resp: BinanceOrderResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
+                    TradingError::Parse("failed to parse futures cancel_order response".to_string())
+                })
+            }
+            InstrumentType::Spot => {
+                let client = self.spot_private_client()?;
+                let path = format!("/api/v3/order?symbol={symbol}&origClientOrderId={order_id}");
+                debug!(symbol = %symbol, order_id = order_id, "Canceling Spot order");
+                let resp = client.delete(&path).await.map_err(TradingError::from)?;
+                let order_resp: BinanceOrderResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
+                    TradingError::Parse("failed to parse spot cancel_order response".to_string())
+                })
+            }
+        }
     }
 
-    async fn get_open_orders(&self, _key: InstrumentKey) -> Result<Vec<Order>, TradingError> {
-        Err(TradingError::Other(
-            "Binance get_open_orders not implemented yet".to_string(),
-        ))
+    async fn get_open_orders(&self, key: InstrumentKey) -> Result<Vec<Order>, TradingError> {
+        let instrument = self
+            .registry
+            .get(&key)
+            .ok_or(TradingError::UnsupportedInstrument)?;
+        let symbol = instrument.exchange_symbol;
+
+        match key.instrument_type {
+            InstrumentType::Swap => {
+                let client = self.futures_private_client()?;
+                let path = format!("/fapi/v1/openOrders?symbol={symbol}");
+                debug!(symbol = %symbol, "Fetching Futures open orders");
+                let resp = client.get(&path).await.map_err(TradingError::from)?;
+                let orders: Vec<BinanceOrderResponse> = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                Ok(orders
+                    .iter()
+                    .filter_map(|o| binance_order_response_to_order(o, key, "", &o.client_order_id))
+                    .collect())
+            }
+            InstrumentType::Spot => {
+                let client = self.spot_private_client()?;
+                let path = format!("/api/v3/openOrders?symbol={symbol}");
+                debug!(symbol = %symbol, "Fetching Spot open orders");
+                let resp = client.get(&path).await.map_err(TradingError::from)?;
+                let orders: Vec<BinanceOrderResponse> = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                Ok(orders
+                    .iter()
+                    .filter_map(|o| binance_order_response_to_order(o, key, "", &o.client_order_id))
+                    .collect())
+            }
+        }
     }
 
     async fn get_order_status(
         &self,
-        _key: InstrumentKey,
-        _order_id: &str,
+        key: InstrumentKey,
+        order_id: &str,
     ) -> Result<Order, TradingError> {
-        Err(TradingError::Other(
-            "Binance get_order_status not implemented yet".to_string(),
-        ))
+        let instrument = self
+            .registry
+            .get(&key)
+            .ok_or(TradingError::UnsupportedInstrument)?;
+        let symbol = instrument.exchange_symbol;
+
+        match key.instrument_type {
+            InstrumentType::Swap => {
+                let client = self.futures_private_client()?;
+                let path = format!("/fapi/v1/order?symbol={symbol}&origClientOrderId={order_id}");
+                debug!(symbol = %symbol, order_id = order_id, "Querying Futures order status");
+                let resp = client.get(&path).await.map_err(TradingError::from)?;
+                let order_resp: BinanceOrderResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
+                    TradingError::Parse("failed to parse futures order status response".to_string())
+                })
+            }
+            InstrumentType::Spot => {
+                let client = self.spot_private_client()?;
+                let path = format!("/api/v3/order?symbol={symbol}&origClientOrderId={order_id}");
+                debug!(symbol = %symbol, order_id = order_id, "Querying Spot order status");
+                let resp = client.get(&path).await.map_err(TradingError::from)?;
+                let order_resp: BinanceOrderResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
+                    TradingError::Parse("failed to parse spot order status response".to_string())
+                })
+            }
+        }
     }
 
     async fn stream_executions(&self, tx: mpsc::Sender<OrderEvent>) -> Result<(), AccountError> {
@@ -633,9 +795,65 @@ impl OrderExecutionProvider for BinanceClient {
 #[async_trait]
 impl PositionProvider for BinanceClient {
     async fn fetch_positions(&self) -> Result<Vec<Position>, TradingError> {
-        Err(TradingError::Other(
-            "Binance fetch_positions not implemented yet".to_string(),
-        ))
+        let client = self.futures_private_client()?;
+        debug!("Fetching Binance Futures position risk");
+        let resp = client
+            .get("/fapi/v3/positionRisk")
+            .await
+            .map_err(TradingError::from)?;
+        let risks: Vec<BinanceFuturesPositionRisk> = resp
+            .json()
+            .await
+            .map_err(|e| TradingError::Parse(e.to_string()))?;
+
+        let positions: Vec<Position> = risks
+            .iter()
+            .filter_map(|risk| {
+                // Look up instrument key by exchange symbol in the registry.
+                let instrument = self.registry.get_by_exchange_symbol(
+                    boldtrax_core::types::Exchange::Binance,
+                    &risk.symbol,
+                    InstrumentType::Swap,
+                )?;
+                binance_position_risk_to_position(risk, instrument.key)
+            })
+            .collect();
+
+        Ok(positions)
+    }
+
+    async fn stream_position_updates(
+        &self,
+        tx: mpsc::Sender<WsPositionPatch>,
+    ) -> Result<(), AccountError> {
+        if !matches!(
+            self.config.mode,
+            BinanceApiMode::Futures | BinanceApiMode::Both
+        ) {
+            std::future::pending::<()>().await;
+            return Ok(());
+        }
+
+        let client = self.futures_private_client()?.clone();
+        let base_ws_url = if self.config.testnet {
+            BINANCE_FUTURES_WS_TESTNET_URL
+        } else {
+            BINANCE_FUTURES_WS_BASE_URL
+        }
+        .to_string();
+
+        let policy = BinanceFuturesUserDataPolicy::new_for_positions(
+            client,
+            base_ws_url,
+            self.registry.clone(),
+            tx,
+        );
+
+        let cancel = CancellationToken::new();
+        let handle = ws_supervisor_spawn(policy, cancel);
+        handle.join().await;
+
+        Ok(())
     }
 }
 

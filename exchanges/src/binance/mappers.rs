@@ -1,7 +1,8 @@
 //! Mappers to convert Binance types to core types
 
 use boldtrax_core::manager::types::{
-    AccountModel, AccountPartitionRef, AccountSnapshot, BalanceView, CollateralScope, PartitionKind,
+    AccountModel, AccountPartitionRef, AccountSnapshot, BalanceView, CollateralScope,
+    PartitionKind, WsPositionPatch,
 };
 use boldtrax_core::types::{
     Exchange, FundingInterval, FundingRatePoint, FundingRateSeries, FundingRateSnapshot,
@@ -16,6 +17,10 @@ use crate::binance::types::{
     BinanceSpotBalance, BinanceWsDepthEvent,
 };
 use crate::binance::types::{BinanceFuturesOrderTradeUpdate, BinanceSpotExecutionReport};
+use crate::binance::types::{
+    BinanceFuturesPositionRisk, BinanceFuturesWsPosition, BinanceOrderResponse,
+};
+use boldtrax_core::types::Position;
 use boldtrax_core::types::{Order, OrderEvent, OrderRequest, OrderSide, OrderStatus, OrderType};
 
 pub fn pairs_to_symbol(pair: Pairs) -> String {
@@ -319,6 +324,152 @@ pub fn spot_execution_to_order_event(
     };
 
     Some(order.into())
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Order REST mappers
+// ──────────────────────────────────────────────────────────────────
+
+/// Map a Binance REST order response (new order, query, or cancel) to the
+/// internal [`Order`] type.
+///
+/// `internal_id` is the caller-maintained identifier (usually the
+/// `client_order_id` that was submitted to the exchange).  `strategy_id` can
+/// be passed as an empty string when it is not known at the call site (e.g.
+/// when querying open orders); the `OrderManager` can patch it later.
+pub fn binance_order_response_to_order(
+    response: &BinanceOrderResponse,
+    key: InstrumentKey,
+    strategy_id: &str,
+    internal_id: &str,
+) -> Option<Order> {
+    let update_time = ms_to_datetime(response.update_time)?;
+    let creation_time = response
+        .time
+        .and_then(ms_to_datetime)
+        .unwrap_or(update_time);
+
+    let side = match response.side.as_str() {
+        "BUY" => OrderSide::Buy,
+        "SELL" => OrderSide::Sell,
+        _ => return None,
+    };
+
+    let order_type = match response.order_type.as_str() {
+        "MARKET" => OrderType::Market,
+        "LIMIT" => OrderType::Limit,
+        "LIMIT_MAKER" | "POST_ONLY" => OrderType::PostOnly,
+        _ => OrderType::Market,
+    };
+
+    let status = match response.status.as_str() {
+        "NEW" | "PENDING_NEW" => OrderStatus::New,
+        "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+        "FILLED" => OrderStatus::Filled,
+        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => OrderStatus::Canceled,
+        "REJECTED" => OrderStatus::Rejected,
+        _ => return None,
+    };
+
+    let size = Decimal::from_str(&response.orig_qty).ok()?;
+    let filled_size = Decimal::from_str(&response.executed_qty).ok()?;
+    let price = Decimal::from_str(&response.price)
+        .ok()
+        .filter(|p| !p.is_zero());
+
+    // Prefer the explicit `avgPrice` futures field; fall back to computing
+    // from `cummulativeQuoteQty / executedQty` for spot filled orders.
+    let avg_fill_price = response
+        .avg_price
+        .as_ref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .filter(|p| !p.is_zero())
+        .or_else(|| {
+            if filled_size.is_zero() {
+                return None;
+            }
+            response
+                .cummulative_quote_qty
+                .as_ref()
+                .and_then(|q| Decimal::from_str(q).ok())
+                .filter(|q| !q.is_zero())
+                .map(|q| q / filled_size)
+        });
+
+    let request = OrderRequest {
+        key,
+        side,
+        order_type,
+        price,
+        size,
+        strategy_id: strategy_id.to_string(),
+    };
+
+    Some(Order {
+        internal_id: internal_id.to_string(),
+        strategy_id: strategy_id.to_string(),
+        client_order_id: response.client_order_id.clone(),
+        exchange_order_id: Some(response.order_id.to_string()),
+        request,
+        status,
+        filled_size,
+        avg_fill_price,
+        created_at: creation_time,
+        updated_at: update_time,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Position REST mappers
+// ──────────────────────────────────────────────────────────────────
+
+/// Convert a single Binance futures position risk entry to a [`Position`].
+///
+/// Returns `None` when `positionAmt` is zero (i.e. no open position).
+pub fn binance_position_risk_to_position(
+    risk: &BinanceFuturesPositionRisk,
+    key: InstrumentKey,
+) -> Option<Position> {
+    let size = Decimal::from_str(&risk.position_amt).ok()?;
+    if size.is_zero() {
+        return None;
+    }
+
+    let entry_price = Decimal::from_str(&risk.entry_price).ok()?;
+    let unrealized_pnl = Decimal::from_str(&risk.un_realized_profit).ok()?;
+
+    let liquidation_price = Decimal::from_str(&risk.liquidation_price)
+        .ok()
+        .filter(|p| !p.is_zero());
+
+    Some(Position {
+        key,
+        size,
+        entry_price,
+        unrealized_pnl,
+        leverage: Decimal::ONE,
+        liquidation_price,
+    })
+}
+
+/// Convert a WebSocket `ACCOUNT_UPDATE` position entry to a [`WsPositionPatch`].
+///
+/// Unlike the old mapper this never returns `None`: a zero `size` is a valid
+/// "position closed" signal that the `PositionManagerActor` needs to act on.
+/// Returns `None` only when the numeric fields cannot be parsed.
+pub fn ws_position_to_patch(
+    ws_pos: &BinanceFuturesWsPosition,
+    key: InstrumentKey,
+) -> Option<WsPositionPatch> {
+    let size = Decimal::from_str(&ws_pos.position_amt).ok()?;
+    let entry_price = Decimal::from_str(&ws_pos.entry_price).ok()?;
+    let unrealized_pnl = Decimal::from_str(&ws_pos.unrealized_profit).ok()?;
+    Some(WsPositionPatch {
+        key,
+        size,
+        entry_price,
+        unrealized_pnl,
+    })
 }
 
 pub fn futures_execution_to_order_event(

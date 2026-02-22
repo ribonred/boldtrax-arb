@@ -463,8 +463,41 @@ pub enum BinanceFuturesUserDataEvent {
         #[serde(rename = "o")]
         order: Box<BinanceFuturesOrderTradeUpdate>,
     },
+    #[serde(rename = "ACCOUNT_UPDATE")]
+    AccountUpdate {
+        #[serde(rename = "a")]
+        update: BinanceFuturesAccountUpdate,
+    },
     #[serde(other)]
     Other,
+}
+
+/// Payload inside an `ACCOUNT_UPDATE` user-data event.
+#[derive(Debug, Deserialize)]
+pub struct BinanceFuturesAccountUpdate {
+    /// Changed positions (only positions that changed are included).
+    #[serde(rename = "P")]
+    pub positions: Vec<BinanceFuturesWsPosition>,
+}
+
+/// A single position entry inside an `ACCOUNT_UPDATE` event.
+#[derive(Debug, Deserialize)]
+pub struct BinanceFuturesWsPosition {
+    /// Symbol, e.g. `"BTCUSDT"`.
+    #[serde(rename = "s")]
+    pub symbol: String,
+    /// Signed position amount (positive = long, negative = short, zero = closed).
+    #[serde(rename = "pa")]
+    pub position_amt: String,
+    /// Entry price.
+    #[serde(rename = "ep")]
+    pub entry_price: String,
+    /// Unrealized PnL.
+    #[serde(rename = "up")]
+    pub unrealized_profit: String,
+    /// `"BOTH"` in one-way mode; `"LONG"` / `"SHORT"` in hedge mode.
+    #[serde(rename = "ps")]
+    pub position_side: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,4 +551,65 @@ pub struct BinanceWsApiSubscribeResult {
 pub struct BinanceWsApiEnvelope {
     pub subscription_id: u64,
     pub event: serde_json::Value,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Order REST types
+// ──────────────────────────────────────────────────────────────────
+
+/// Unified REST response for order placement, queries, and cancellations.
+///
+/// Works for both Spot (`/api/v3/order`) and Futures (`/fapi/v1/order`).
+/// Fields that are only present on one side are made optional.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceOrderResponse {
+    pub symbol: String,
+    pub order_id: i64,
+    pub client_order_id: String,
+    /// Price string; `"0"` for market orders.
+    pub price: String,
+    /// Original order quantity.
+    pub orig_qty: String,
+    /// Cumulative filled quantity.
+    pub executed_qty: String,
+    pub status: String,
+    #[serde(rename = "type")]
+    pub order_type: String,
+    pub side: String,
+    /// Order creation time (ms). Present on query/cancel responses.
+    #[serde(default)]
+    pub time: Option<i64>,
+    pub update_time: i64,
+    /// Average fill price – Futures field (`avgPrice`).
+    #[serde(default)]
+    pub avg_price: Option<String>,
+    /// Cumulative quote asset traded – Spot field (`cummulativeQuoteQty`).
+    /// Used to compute the average fill price for spot orders.
+    #[serde(default)]
+    pub cummulative_quote_qty: Option<String>,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Position REST types
+// ──────────────────────────────────────────────────────────────────
+
+/// Single entry from `GET /fapi/v3/positionRisk`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceFuturesPositionRisk {
+    pub symbol: String,
+    /// `"BOTH"` in one-way mode; `"LONG"` / `"SHORT"` in hedge mode.
+    #[serde(default)]
+    pub position_side: String,
+    /// Signed position size (negative = short).
+    pub position_amt: String,
+    pub entry_price: String,
+    /// `unRealizedProfit` in the v3 response (capital R).
+    /// With `camelCase`, the field name `un_realized_profit` serialises to `unRealizedProfit`.
+    pub un_realized_profit: String,
+    /// `"0"` when there is no open position.
+    pub liquidation_price: String,
+    pub mark_price: String,
+    pub update_time: i64,
 }

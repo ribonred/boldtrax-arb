@@ -10,7 +10,6 @@ pub mod ws;
 pub mod zmq;
 
 pub use http::*;
-pub use logger::*;
 pub use manager::*;
 pub use registry::*;
 pub use traits::*;
