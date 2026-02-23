@@ -5,9 +5,10 @@ use reqwest::{Client, Request, Response, StatusCode};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
 struct AuthMiddleware {
@@ -248,6 +249,150 @@ impl TracedHttpClient {
     /// Get base URL
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Response extension — safe JSON parsing with raw-body logging
+// ──────────────────────────────────────────────────────────────────
+
+/// Extension trait on `reqwest::Response` that reads the body as text first,
+/// then attempts JSON deserialization.  On parse failure the **full raw body**
+/// is logged at ERROR level so we never lose exchange payloads.
+///
+/// # Variants
+///
+/// - [`json_logged`](ResponseExt::json_logged) — parse JSON, log raw body on failure.
+/// - [`json_checked`](ResponseExt::json_checked) — run an error detector on the raw
+///   body *before* parsing.  Catches exchanges that return HTTP 200 with an error
+///   payload (Kraken, some Binance edge cases, etc.).
+///
+/// # Examples
+///
+/// ```ignore
+/// use boldtrax_core::http::ResponseExt;
+///
+/// // Simple — just log on parse failure
+/// let order: OrderResp = resp.json_logged("spot place_order").await?;
+///
+/// // With error detector — catch Binance-style {"code":-1015,"msg":"..."}
+/// let order: OrderResp = resp
+///     .json_checked("spot place_order", |raw| {
+///         let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+///         let code = v.get("code")?.as_i64()?;
+///         if code < 0 {
+///             let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+///             Some(format!("exchange error {code}: {msg}"))
+///         } else {
+///             None
+///         }
+///     })
+///     .await?;
+///
+/// // Kraken-style {"error":["EGeneral:Invalid arguments"],"result":{}}
+/// let data: KrakenResp = resp
+///     .json_checked("kraken place_order", |raw| {
+///         let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+///         let errs = v.get("error")?.as_array()?;
+///         if errs.is_empty() { return None; }
+///         let msgs: Vec<&str> = errs.iter().filter_map(|e| e.as_str()).collect();
+///         Some(msgs.join("; "))
+///     })
+///     .await?;
+/// ```
+#[async_trait]
+pub trait ResponseExt {
+    /// Consume the response, read the body as text, then deserialize as JSON.
+    /// On failure the raw body and context string are logged at ERROR level.
+    async fn json_logged<T: DeserializeOwned>(self, context: &str) -> Result<T, ClientError>;
+
+    /// Like [`json_logged`](Self::json_logged), but first runs an error detector
+    /// on the raw body text. If it returns `Some(msg)`, the request is treated
+    /// as failed **without** attempting deserialization.
+    ///
+    /// Returns `(body_text, status)` so the caller can run a sync check.
+    /// See [`check_and_parse`] for the convenience wrapper.
+    async fn text_logged(self, context: &str) -> Result<(String, StatusCode), ClientError>;
+}
+
+/// Read response body, run an exchange-specific error detector, then parse JSON.
+///
+/// Combines [`ResponseExt::text_logged`] with a caller-supplied `is_error` check.
+/// If `is_error` returns `Some(msg)`, the raw body is logged and an error is returned.
+///
+/// ```ignore
+/// use boldtrax_core::http::{ResponseExt, check_and_parse};
+///
+/// fn binance_error(raw: &str) -> Option<String> {
+///     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+///     let code = v.get("code")?.as_i64()?;
+///     (code < 0).then(|| {
+///         let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+///         format!("exchange error {code}: {msg}")
+///     })
+/// }
+///
+/// let order: BinanceOrderResponse = check_and_parse(
+///     resp, "spot place_order", binance_error,
+/// ).await?;
+/// ```
+pub async fn check_and_parse<T: DeserializeOwned>(
+    resp: Response,
+    context: &str,
+    is_error: fn(&str) -> Option<String>,
+) -> Result<T, ClientError> {
+    let (body, status) = resp.text_logged(context).await?;
+
+    if let Some(exchange_err) = is_error(&body) {
+        error!(
+            context = context,
+            status = %status,
+            raw_body = %body,
+            exchange_error = %exchange_err,
+            "Exchange returned 200 with error payload"
+        );
+        return Err(ClientError::InvalidResponse(format!(
+            "{context}: {exchange_err}"
+        )));
+    }
+
+    serde_json::from_str::<T>(&body).map_err(|e| {
+        error!(
+            context = context,
+            status = %status,
+            raw_body = %body,
+            "JSON parse failed — raw response logged"
+        );
+        ClientError::InvalidResponse(format!("{context}: {e}"))
+    })
+}
+
+#[async_trait]
+impl ResponseExt for Response {
+    async fn json_logged<T: DeserializeOwned>(self, context: &str) -> Result<T, ClientError> {
+        let status = self.status();
+        let body = self
+            .text()
+            .await
+            .map_err(|e| ClientError::InvalidResponse(format!("{context}: read body: {e}")))?;
+        serde_json::from_str::<T>(&body).map_err(|e| {
+            error!(
+                context = context,
+                status = %status,
+                raw_body = %body,
+                "JSON parse failed — raw response logged"
+            );
+            ClientError::InvalidResponse(format!("{context}: {e}"))
+        })
+    }
+
+    async fn text_logged(self, context: &str) -> Result<(String, StatusCode), ClientError> {
+        let status = self.status();
+        let body = self
+            .text()
+            .await
+            .map_err(|e| ClientError::InvalidResponse(format!("{context}: read body: {e}")))?;
+        Ok((body, status))
     }
 }
 

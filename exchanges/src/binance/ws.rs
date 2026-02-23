@@ -201,10 +201,7 @@ impl BinanceFuturesUserDataPolicy {
 #[async_trait]
 impl WsPolicy for BinanceFuturesUserDataPolicy {
     async fn prepare(&mut self) -> anyhow::Result<String> {
-        let response = self
-            .client
-            .post_empty("/fapi/v1/listenKey")
-            .await?;
+        let response = self.client.post_empty("/fapi/v1/listenKey").await?;
         let data: crate::binance::types::BinanceListenKeyResponse = response
             .json()
             .await

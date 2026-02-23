@@ -12,6 +12,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
+use crate::binance::codec::BinanceClientOrderIdCodec;
 use crate::binance::types::{
     BinanceFundingRateHistory, BinanceFuturesBalance, BinancePartialDepth, BinancePremiumIndex,
     BinanceSpotBalance, BinanceWsDepthEvent,
@@ -279,8 +280,10 @@ pub fn spot_execution_to_order_event(
     let order_type = match report.order_type.as_str() {
         "MARKET" => OrderType::Market,
         "LIMIT" => OrderType::Limit,
+        "LIMIT_MAKER" | "POST_ONLY" => OrderType::Limit,
         _ => return None,
     };
+    let post_only = matches!(report.order_type.as_str(), "LIMIT_MAKER" | "POST_ONLY");
 
     let status = match report.order_status.as_str() {
         "NEW" => OrderStatus::New,
@@ -301,20 +304,27 @@ pub fn spot_execution_to_order_event(
         .ok()
         .filter(|p| !p.is_zero());
 
+    let codec = BinanceClientOrderIdCodec;
+    let strategy_id = codec
+        .decode_strategy_id(&report.client_order_id)
+        .unwrap_or_default();
+
     let request = OrderRequest {
         key,
         side,
         order_type,
         price,
         size,
-        strategy_id: "".to_string(), // Binance doesn't return our internal strategy ID
+        post_only,
+        reduce_only: false,
+        strategy_id: strategy_id.clone(),
     };
 
     let order = Order {
-        internal_id: report.client_order_id.clone(),
-        strategy_id: "".to_string(), // OrderManager will fill this in based on internal_id
+        internal_id: codec.decode_internal_id(&report.client_order_id),
+        strategy_id,
         client_order_id: report.client_order_id.clone(),
-        exchange_order_id: Some(report.client_order_id.clone()),
+        exchange_order_id: Some(report.order_id.to_string()),
         request,
         status,
         filled_size,
@@ -343,7 +353,13 @@ pub fn binance_order_response_to_order(
     strategy_id: &str,
     internal_id: &str,
 ) -> Option<Order> {
-    let update_time = ms_to_datetime(response.update_time)?;
+    // Resolve update time: prefer `update_time` (futures/query),
+    // fall back to `transact_time` (spot POST), then `time`.
+    let update_time = response
+        .update_time
+        .or(response.transact_time)
+        .or(response.time)
+        .and_then(ms_to_datetime)?;
     let creation_time = response
         .time
         .and_then(ms_to_datetime)
@@ -358,9 +374,10 @@ pub fn binance_order_response_to_order(
     let order_type = match response.order_type.as_str() {
         "MARKET" => OrderType::Market,
         "LIMIT" => OrderType::Limit,
-        "LIMIT_MAKER" | "POST_ONLY" => OrderType::PostOnly,
+        "LIMIT_MAKER" | "POST_ONLY" => OrderType::Limit,
         _ => OrderType::Market,
     };
+    let post_only = matches!(response.order_type.as_str(), "LIMIT_MAKER" | "POST_ONLY");
 
     let status = match response.status.as_str() {
         "NEW" | "PENDING_NEW" => OrderStatus::New,
@@ -402,6 +419,8 @@ pub fn binance_order_response_to_order(
         order_type,
         price,
         size,
+        post_only,
+        reduce_only: false,
         strategy_id: strategy_id.to_string(),
     };
 
@@ -418,10 +437,6 @@ pub fn binance_order_response_to_order(
         updated_at: update_time,
     })
 }
-
-// ──────────────────────────────────────────────────────────────────
-// Position REST mappers
-// ──────────────────────────────────────────────────────────────────
 
 /// Convert a single Binance futures position risk entry to a [`Position`].
 ///
@@ -485,8 +500,10 @@ pub fn futures_execution_to_order_event(
     let order_type = match report.order_type.as_str() {
         "MARKET" => OrderType::Market,
         "LIMIT" => OrderType::Limit,
+        "LIMIT_MAKER" | "POST_ONLY" => OrderType::Limit,
         _ => return None,
     };
+    let post_only = matches!(report.order_type.as_str(), "LIMIT_MAKER" | "POST_ONLY");
 
     let status = match report.order_status.as_str() {
         "NEW" => OrderStatus::New,
@@ -507,20 +524,27 @@ pub fn futures_execution_to_order_event(
         .ok()
         .filter(|p| !p.is_zero());
 
+    let codec = BinanceClientOrderIdCodec;
+    let strategy_id = codec
+        .decode_strategy_id(&report.client_order_id)
+        .unwrap_or_default();
+
     let request = OrderRequest {
         key,
         side,
         order_type,
         price,
         size,
-        strategy_id: "".to_string(),
+        post_only,
+        reduce_only: false,
+        strategy_id: strategy_id.clone(),
     };
 
     let order = Order {
-        internal_id: report.client_order_id.clone(),
-        strategy_id: "".to_string(), // OrderManager will fill this in based on internal_id
+        internal_id: codec.decode_internal_id(&report.client_order_id),
+        strategy_id,
         client_order_id: report.client_order_id.clone(),
-        exchange_order_id: Some(report.client_order_id.clone()),
+        exchange_order_id: Some(report.order_id.to_string()),
         request,
         status,
         filled_size,

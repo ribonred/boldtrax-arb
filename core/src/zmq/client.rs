@@ -130,6 +130,47 @@ impl ZmqCommandClient {
         }
     }
 
+    pub async fn get_reference_price(
+        &mut self,
+        key: InstrumentKey,
+    ) -> Result<rust_decimal::Decimal> {
+        let response = self
+            .send_command(ZmqCommand::GetReferencePrice(key))
+            .await?;
+        match response {
+            ZmqResponse::ReferencePrice(price) => Ok(price),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    pub async fn get_funding_rate(
+        &mut self,
+        key: InstrumentKey,
+    ) -> Result<crate::types::FundingRateSnapshot> {
+        let response = self.send_command(ZmqCommand::GetFundingRate(key)).await?;
+        match response {
+            ZmqResponse::FundingRate(snapshot) => Ok(snapshot),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    pub async fn set_leverage(
+        &mut self,
+        key: InstrumentKey,
+        leverage: rust_decimal::Decimal,
+    ) -> Result<rust_decimal::Decimal> {
+        let response = self
+            .send_command(ZmqCommand::SetLeverage(key, leverage))
+            .await?;
+        match response {
+            ZmqResponse::SetLeverageAck(actual) => Ok(actual),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
     async fn send_command(&mut self, command: ZmqCommand) -> Result<ZmqResponse> {
         let payload = rkyv::to_bytes::<_, 1024>(&command).unwrap();
 
@@ -143,15 +184,12 @@ impl ZmqCommandClient {
             .await
             .context("Timeout waiting for ZMQ response")??;
 
-        // DEALER receives: [Empty, Payload]
         if response_msg.len() < 2 {
             anyhow::bail!("Received malformed DEALER message");
         }
 
         let payload_bytes = response_msg.get(1).unwrap();
-        
-        // Ensure the payload is properly aligned for rkyv
-        // rkyv requires 8-byte alignment for some types
+
         let mut aligned_payload = rkyv::AlignedVec::with_capacity(payload_bytes.len());
         aligned_payload.extend_from_slice(payload_bytes);
 
@@ -178,13 +216,13 @@ impl ZmqEventSubscriber {
                         }
 
                         let payload_bytes = msg.get(1).unwrap();
-                        
-                        // Ensure the payload is properly aligned for rkyv
-                        // rkyv requires 8-byte alignment for some types
-                        let mut aligned_payload = rkyv::AlignedVec::with_capacity(payload_bytes.len());
+
+                        let mut aligned_payload =
+                            rkyv::AlignedVec::with_capacity(payload_bytes.len());
                         aligned_payload.extend_from_slice(payload_bytes);
 
-                        let archived = match rkyv::check_archived_root::<ZmqEvent>(&aligned_payload) {
+                        let archived = match rkyv::check_archived_root::<ZmqEvent>(&aligned_payload)
+                        {
                             Ok(a) => a,
                             Err(e) => {
                                 error!(error = %e, "Failed to validate event payload");

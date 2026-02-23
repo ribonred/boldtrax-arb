@@ -1,7 +1,9 @@
 use crate::manager::account::{AccountManager, AccountManagerHandle};
+use crate::manager::price::{PriceManager, PriceManagerHandle};
 use crate::order::OrderManagerHandle;
 use crate::position::PositionManagerHandle;
 use crate::registry::InstrumentRegistry;
+use crate::traits::{FundingRateMarketData, LeverageProvider};
 use crate::types::Exchange;
 use crate::zmq::discovery::{DiscoveryClient, ServiceType};
 use crate::zmq::protocol::{ZmqCommand, ZmqEvent, ZmqResponse};
@@ -18,41 +20,228 @@ pub struct ZmqServerConfig {
     pub ttl_secs: u64,
 }
 
-pub struct ZmqServer {
+/// Builder for constructing a [`ZmqServer`] with optional manager handles.
+pub struct ZmqServerBuilder {
     config: ZmqServerConfig,
+    registry: InstrumentRegistry,
+    event_rx: broadcast::Receiver<ZmqEvent>,
     order_handle: Option<OrderManagerHandle>,
     position_handle: Option<PositionManagerHandle>,
     account_handle: Option<AccountManagerHandle>,
-    registry: InstrumentRegistry,
-    event_rx: broadcast::Receiver<ZmqEvent>,
+    price_handle: Option<PriceManagerHandle>,
+    leverage_provider: Option<Arc<dyn LeverageProvider>>,
+    funding_rate_provider: Option<Arc<dyn FundingRateMarketData + Send + Sync>>,
 }
 
-impl ZmqServer {
+impl ZmqServerBuilder {
     pub fn new(
         config: ZmqServerConfig,
-        order_handle: Option<OrderManagerHandle>,
-        position_handle: Option<PositionManagerHandle>,
-        account_handle: Option<AccountManagerHandle>,
         registry: InstrumentRegistry,
         event_rx: broadcast::Receiver<ZmqEvent>,
     ) -> Self {
         Self {
             config,
-            order_handle,
-            position_handle,
-            account_handle,
             registry,
             event_rx,
+            order_handle: None,
+            position_handle: None,
+            account_handle: None,
+            price_handle: None,
+            leverage_provider: None,
+            funding_rate_provider: None,
         }
+    }
+
+    pub fn order_handle(mut self, handle: OrderManagerHandle) -> Self {
+        self.order_handle = Some(handle);
+        self
+    }
+
+    pub fn position_handle(mut self, handle: PositionManagerHandle) -> Self {
+        self.position_handle = Some(handle);
+        self
+    }
+
+    pub fn account_handle(mut self, handle: AccountManagerHandle) -> Self {
+        self.account_handle = Some(handle);
+        self
+    }
+
+    pub fn price_handle(mut self, handle: PriceManagerHandle) -> Self {
+        self.price_handle = Some(handle);
+        self
+    }
+
+    pub fn leverage_provider(mut self, provider: Arc<dyn LeverageProvider>) -> Self {
+        self.leverage_provider = Some(provider);
+        self
+    }
+
+    pub fn funding_rate_provider(
+        mut self,
+        provider: Arc<dyn FundingRateMarketData + Send + Sync>,
+    ) -> Self {
+        self.funding_rate_provider = Some(provider);
+        self
+    }
+
+    pub fn build(self) -> ZmqServer {
+        let exchange = self.config.exchange;
+        ZmqServer {
+            config: self.config,
+            dispatcher: CommandDispatcher {
+                exchange,
+                order_handle: self.order_handle,
+                position_handle: self.position_handle,
+                account_handle: self.account_handle,
+                price_handle: self.price_handle,
+                leverage_provider: self.leverage_provider,
+                funding_rate_provider: self.funding_rate_provider,
+                registry: self.registry,
+            },
+            event_rx: self.event_rx,
+        }
+    }
+}
+
+/// Groups all manager handles needed for command dispatch.
+struct CommandDispatcher {
+    exchange: Exchange,
+    order_handle: Option<OrderManagerHandle>,
+    position_handle: Option<PositionManagerHandle>,
+    account_handle: Option<AccountManagerHandle>,
+    price_handle: Option<PriceManagerHandle>,
+    leverage_provider: Option<Arc<dyn LeverageProvider>>,
+    funding_rate_provider: Option<Arc<dyn FundingRateMarketData + Send + Sync>>,
+    registry: InstrumentRegistry,
+}
+
+impl CommandDispatcher {
+    async fn dispatch(&self, command: ZmqCommand) -> ZmqResponse {
+        match command {
+            ZmqCommand::SubmitOrder(req) => {
+                if let Some(handle) = &self.order_handle {
+                    match handle.submit_order(req).await {
+                        Ok(order) => ZmqResponse::SubmitAck(order),
+                        Err(e) => ZmqResponse::Error(e.to_string()),
+                    }
+                } else {
+                    ZmqResponse::Error(
+                        "Order management not implemented for this exchange".to_string(),
+                    )
+                }
+            }
+            ZmqCommand::CancelOrder(id) => {
+                if let Some(handle) = &self.order_handle {
+                    match handle.cancel_order(id).await {
+                        Ok(order) => ZmqResponse::CancelAck(order),
+                        Err(e) => ZmqResponse::Error(e.to_string()),
+                    }
+                } else {
+                    ZmqResponse::Error(
+                        "Order management not implemented for this exchange".to_string(),
+                    )
+                }
+            }
+            ZmqCommand::GetPosition(key) => {
+                if let Some(handle) = &self.position_handle {
+                    let pos = handle.get_position(key).await;
+                    ZmqResponse::Position(pos)
+                } else {
+                    ZmqResponse::Error(
+                        "Position management not implemented for this exchange".to_string(),
+                    )
+                }
+            }
+            ZmqCommand::GetAllPositions => {
+                if let Some(handle) = &self.position_handle {
+                    let positions = handle.get_all_positions().await;
+                    ZmqResponse::AllPositions(positions)
+                } else {
+                    ZmqResponse::Error(
+                        "Position management not implemented for this exchange".to_string(),
+                    )
+                }
+            }
+            ZmqCommand::GetAccountSnapshot => {
+                if let Some(handle) = &self.account_handle {
+                    match handle.get_snapshot(self.exchange).await {
+                        Ok(snap) => ZmqResponse::AccountSnapshot(snap),
+                        Err(e) => ZmqResponse::Error(e.to_string()),
+                    }
+                } else {
+                    ZmqResponse::Error(
+                        "Account management not implemented for this exchange".to_string(),
+                    )
+                }
+            }
+            ZmqCommand::GetInstrument(key) => ZmqResponse::Instrument(self.registry.get(&key)),
+            ZmqCommand::GetAllInstruments => ZmqResponse::AllInstruments(self.registry.get_all()),
+            ZmqCommand::GetReferencePrice(key) => {
+                if let Some(handle) = &self.price_handle {
+                    match handle.get_snapshot(key).await {
+                        Ok(snap) => {
+                            if let Some(mid) = snap.mid {
+                                ZmqResponse::ReferencePrice(mid)
+                            } else {
+                                ZmqResponse::Error("Mid price not available".to_string())
+                            }
+                        }
+                        Err(e) => ZmqResponse::Error(e.to_string()),
+                    }
+                } else {
+                    ZmqResponse::Error(
+                        "Price management not implemented for this exchange".to_string(),
+                    )
+                }
+            }
+            ZmqCommand::SetLeverage(key, leverage) => {
+                if let Some(provider) = &self.leverage_provider {
+                    match provider.set_leverage(key, leverage).await {
+                        Ok(actual) => ZmqResponse::SetLeverageAck(actual),
+                        Err(e) => ZmqResponse::Error(e.to_string()),
+                    }
+                } else {
+                    ZmqResponse::Error(
+                        "Leverage management not implemented for this exchange".to_string(),
+                    )
+                }
+            }
+            ZmqCommand::GetFundingRate(key) => {
+                if let Some(provider) = &self.funding_rate_provider {
+                    match provider.funding_rate_snapshot(key).await {
+                        Ok(snapshot) => ZmqResponse::FundingRate(snapshot),
+                        Err(e) => ZmqResponse::Error(e.to_string()),
+                    }
+                } else {
+                    ZmqResponse::Error(
+                        "Funding rate data not available for this exchange".to_string(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+pub struct ZmqServer {
+    config: ZmqServerConfig,
+    dispatcher: CommandDispatcher,
+    event_rx: broadcast::Receiver<ZmqEvent>,
+}
+
+impl ZmqServer {
+    pub fn builder(
+        config: ZmqServerConfig,
+        registry: InstrumentRegistry,
+        event_rx: broadcast::Receiver<ZmqEvent>,
+    ) -> ZmqServerBuilder {
+        ZmqServerBuilder::new(config, registry, event_rx)
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
         let Self {
             config,
-            order_handle,
-            position_handle,
-            account_handle,
-            registry,
+            dispatcher,
             mut event_rx,
         } = self;
 
@@ -160,15 +349,7 @@ impl ZmqServer {
                     debug!(?command, "Received ZMQ command");
 
                     // Process command
-                    let response = Self::process_command(
-                        config.exchange,
-                        &order_handle,
-                        &position_handle,
-                        &account_handle,
-                        &registry,
-                        command,
-                    )
-                    .await;
+                    let response = dispatcher.dispatch(command).await;
 
                     // Serialize and send response
                     let response_bytes = rkyv::to_bytes::<_, 1024>(&response).unwrap();
@@ -184,76 +365,6 @@ impl ZmqServer {
                     error!(error = %e, "Failed to receive from ROUTER socket");
                 }
             }
-        }
-    }
-
-    async fn process_command(
-        exchange: Exchange,
-        order_handle: &Option<OrderManagerHandle>,
-        position_handle: &Option<PositionManagerHandle>,
-        account_handle: &Option<AccountManagerHandle>,
-        registry: &InstrumentRegistry,
-        command: ZmqCommand,
-    ) -> ZmqResponse {
-        match command {
-            ZmqCommand::SubmitOrder(req) => {
-                if let Some(handle) = order_handle {
-                    match handle.submit_order(req).await {
-                        Ok(order) => ZmqResponse::SubmitAck(order),
-                        Err(e) => ZmqResponse::Error(e.to_string()),
-                    }
-                } else {
-                    ZmqResponse::Error(
-                        "Order management not implemented for this exchange".to_string(),
-                    )
-                }
-            }
-            ZmqCommand::CancelOrder(id) => {
-                if let Some(handle) = order_handle {
-                    match handle.cancel_order(id).await {
-                        Ok(order) => ZmqResponse::CancelAck(order),
-                        Err(e) => ZmqResponse::Error(e.to_string()),
-                    }
-                } else {
-                    ZmqResponse::Error(
-                        "Order management not implemented for this exchange".to_string(),
-                    )
-                }
-            }
-            ZmqCommand::GetPosition(key) => {
-                if let Some(handle) = position_handle {
-                    let pos = handle.get_position(key).await;
-                    ZmqResponse::Position(pos)
-                } else {
-                    ZmqResponse::Error(
-                        "Position management not implemented for this exchange".to_string(),
-                    )
-                }
-            }
-            ZmqCommand::GetAllPositions => {
-                if let Some(handle) = position_handle {
-                    let positions = handle.get_all_positions().await;
-                    ZmqResponse::AllPositions(positions)
-                } else {
-                    ZmqResponse::Error(
-                        "Position management not implemented for this exchange".to_string(),
-                    )
-                }
-            }
-            ZmqCommand::GetAccountSnapshot => {
-                if let Some(handle) = account_handle {
-                    match handle.get_snapshot(exchange).await {
-                        Ok(snap) => ZmqResponse::AccountSnapshot(snap),
-                        Err(e) => ZmqResponse::Error(e.to_string()),
-                    }
-                } else {
-                    ZmqResponse::Error(
-                        "Account management not implemented for this exchange".to_string(),
-                    )
-                }
-            }
-            ZmqCommand::GetInstrument(key) => ZmqResponse::Instrument(registry.get(&key)),
-            ZmqCommand::GetAllInstruments => ZmqResponse::AllInstruments(registry.get_all()),
         }
     }
 

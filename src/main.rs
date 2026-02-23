@@ -1,20 +1,16 @@
 mod cli;
+mod dispatch;
 mod runner;
+mod strategy;
 
-use boldtrax_core::config::types::{AppConfig, ExchangeConfig};
-use boldtrax_core::manager::account::AccountManagerConfig;
-use boldtrax_core::manager::price::PriceManagerConfig;
-use boldtrax_core::order::OrderManagerConfig;
-use boldtrax_core::position::PositionManagerConfig;
-use boldtrax_core::registry::InstrumentRegistry;
-use boldtrax_core::types::{Exchange, ExecutionMode, InstrumentKey, InstrumentType, Pairs};
-use boldtrax_core::zmq::server::ZmqServerConfig;
-use clap::{Parser, Subcommand};
-use dotenvy::dotenv;
-use exchanges::binance::{BinanceClient, BinanceConfig};
-use exchanges::mock::MockExchange;
-use runner::{ExchangeRunner, ExchangeRunnerConfig};
 use std::time::Duration;
+
+use boldtrax_core::config::types::AppConfig;
+use boldtrax_core::types::Exchange;
+use clap::{Parser, Subcommand, ValueEnum};
+use dotenvy::dotenv;
+use strategies::arbitrage::config::SpotPerpStrategyConfig;
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -25,10 +21,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run exchange runners, strategy runners, or both
+    Run {
+        /// What to run: exchange runners, strategy, or all
+        #[arg(short, long, default_value = "all")]
+        mode: RunMode,
+    },
+    /// Interactive manual trading REPL
+    Manual {
+        /// Exchange to connect to via ZMQ
+        #[arg(short, long, default_value = "binance")]
+        exchange: Exchange,
+    },
     /// Initialize configuration via interactive wizard
     Wizard,
     /// Check configuration health
     Doctor,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RunMode {
+    /// Run exchange runners + strategy (monolith)
+    All,
+    /// Run exchange runners only (no strategy)
+    Exchange,
+    /// Run strategy only (connect to external exchange runner via ZMQ)
+    Strategy,
 }
 
 #[tokio::main]
@@ -38,88 +56,182 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match &cli.command {
-        Some(Commands::Wizard) => {
+    // Default to `Run --mode all` when no subcommand is given
+    let command = cli.command.unwrap_or(Commands::Run { mode: RunMode::All });
+
+    match command {
+        Commands::Wizard => {
             cli::wizard::run_wizard()?;
-            return Ok(());
         }
-        Some(Commands::Doctor) => {
+        Commands::Doctor => {
             cli::doctor::run_doctor()?;
-            return Ok(());
         }
-        None => {
-            // Normal startup
-            let app_config = AppConfig::load().unwrap_or_else(|e| {
-                eprintln!("Failed to load configuration: {}", e);
-                eprintln!("Run `boldtrax-bot doctor` to check your configuration.");
-                std::process::exit(1);
-            });
+        Commands::Manual { exchange } => {
+            let app_config = load_and_validate_config();
+            cli::manual::run_manual(&app_config, exchange).await?;
+        }
+        Commands::Run { mode } => {
+            let app_config = load_and_validate_config();
 
             println!(
-                "Starting Boldtrax in {:?} mode...",
-                app_config.execution_mode
+                "Starting Boldtrax in {:?} mode (run mode: {:?})...",
+                app_config.execution_mode, mode
             );
 
-            let config = BinanceConfig::from_app_config(&app_config)?;
-            println!("Loaded Binance config: {:?}", config);
-
-            let registry = InstrumentRegistry::new();
-            let client = BinanceClient::new(config, registry.clone())?;
-            let execution_mode = app_config.execution_mode;
-
-            // Instruments to track across all sub-systems.
-            let tracked_keys = vec![
-                InstrumentKey {
-                    exchange: Exchange::Binance,
-                    pair: Pairs::SOLUSDT,
-                    instrument_type: InstrumentType::Swap,
-                },
-                InstrumentKey {
-                    exchange: Exchange::Binance,
-                    pair: Pairs::SOLUSDT,
-                    instrument_type: InstrumentType::Spot,
-                },
-                InstrumentKey {
-                    exchange: Exchange::Binance,
-                    pair: Pairs::USDCUSDT,
-                    instrument_type: InstrumentType::Spot,
-                },
-            ];
-
-            let runner_config = ExchangeRunnerConfig {
-                exchange: Exchange::Binance,
-                execution_mode,
-                account_reconcile_interval: Duration::from_secs(30),
-                funding_rate_poll_interval: Duration::from_secs(60),
-                tracked_keys,
-                account_manager_config: AccountManagerConfig {
-                    mailbox_capacity: 64,
-                    snapshot_max_age: chrono::Duration::seconds(30),
-                },
-                price_manager_config: PriceManagerConfig::default(),
-                order_manager_config: OrderManagerConfig::default(),
-                position_manager_config: PositionManagerConfig::default(),
-                zmq_config: ZmqServerConfig {
-                    exchange: Exchange::Binance,
-                    redis_url: app_config.redis_url.clone(),
-                    ttl_secs: 30,
-                },
-            };
-
-            match execution_mode {
-                ExecutionMode::Paper => {
-                    let mock_client =
-                        MockExchange::new(client, Exchange::Binance, registry.clone());
-                    ExchangeRunner::new(mock_client, runner_config, registry.clone())
-                        .run()
-                        .await
-                        .map_err(anyhow::Error::from)
-                }
-                ExecutionMode::Live => ExchangeRunner::new(client, runner_config, registry.clone())
-                    .run()
-                    .await
-                    .map_err(anyhow::Error::from),
+            match mode {
+                RunMode::Exchange => run_exchanges(&app_config).await?,
+                RunMode::Strategy => run_strategy(&app_config).await?,
+                RunMode::All => run_all(&app_config).await?,
             }
         }
     }
+
+    Ok(())
+}
+
+/// Load configuration, validate, and exit on failure.
+fn load_and_validate_config() -> AppConfig {
+    let app_config = AppConfig::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load configuration: {}", e);
+        eprintln!("Run `boldtrax-bot doctor` to check your configuration.");
+        std::process::exit(1);
+    });
+
+    let config_errors = app_config.validate();
+    if !config_errors.is_empty() {
+        for err in &config_errors {
+            eprintln!("[CONFIG ERROR] {}", err);
+        }
+        eprintln!("Run `boldtrax-bot doctor` to diagnose.");
+        std::process::exit(1);
+    }
+
+    app_config
+}
+
+/// Run only exchange runners (no strategy).
+async fn run_exchanges(app_config: &AppConfig) -> anyhow::Result<()> {
+    let exchanges = &app_config.runner.exchanges;
+    if exchanges.is_empty() {
+        eprintln!("[FATAL] No exchanges configured in runner.exchanges");
+        std::process::exit(1);
+    }
+
+    let mut handles = Vec::new();
+    for name in exchanges {
+        let handle = dispatch::spawn_exchange_runner(app_config, name).await?;
+        handles.push(handle);
+    }
+
+    info!(
+        count = handles.len(),
+        "Exchange runners started — press Ctrl-C to stop"
+    );
+
+    tokio::select! {
+        _ = async {
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    error!(error = %e, "Exchange runner task failed");
+                }
+            }
+        } => {}
+        _ = tokio::signal::ctrl_c() => {
+            info!("Ctrl-C received — shutting down");
+        }
+    }
+
+    Ok(())
+}
+
+/// Run only strategy (connects to external exchange runner via ZMQ).
+async fn run_strategy(app_config: &AppConfig) -> anyhow::Result<()> {
+    let runner_strategy = app_config
+        .runner
+        .strategies
+        .as_ref()
+        .expect("[runner.strategies] is required for --mode strategy");
+
+    let handle = strategy::spawn_strategy_runner(app_config, &runner_strategy.strategy).await?;
+
+    tokio::select! {
+        res = handle => {
+            if let Err(e) = res {
+                error!(error = %e, "Strategy runner task failed");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Ctrl-C received — shutting down");
+        }
+    }
+
+    Ok(())
+}
+
+/// Run exchange runners + strategy in the same process.
+async fn run_all(app_config: &AppConfig) -> anyhow::Result<()> {
+    // 1. Start exchange runners
+    let exchanges = &app_config.runner.exchanges;
+    if exchanges.is_empty() {
+        eprintln!("[FATAL] No exchanges configured in runner.exchanges");
+        std::process::exit(1);
+    }
+
+    let mut exchange_handles = Vec::new();
+    for name in exchanges {
+        let handle = dispatch::spawn_exchange_runner(app_config, name).await?;
+        exchange_handles.push(handle);
+    }
+
+    info!(count = exchange_handles.len(), "Exchange runners started");
+
+    // 2. Wait for ZMQ services to register before launching strategy
+    let mut strategy_handle = None;
+    if let Some(runner_strategy) = &app_config.runner.strategies {
+        // Strategy config owns instrument keys; derive exchange from there
+        let strategy_config = SpotPerpStrategyConfig::from_strategy_map(&app_config.strategy);
+        let exchange = strategy_config.exchange();
+
+        // Exchange runner needs time to: load instruments, spawn managers,
+        // bind ZMQ sockets, and register in Redis. Give it a generous timeout.
+        strategy::poll_until_ready(&app_config.redis_url, exchange, Duration::from_secs(30)).await;
+
+        match strategy::spawn_strategy_runner(app_config, &runner_strategy.strategy).await {
+            Ok(handle) => {
+                strategy_handle = Some(handle);
+                info!("Strategy '{}' started", runner_strategy.strategy);
+            }
+            Err(e) => {
+                error!(error = %e, strategy = %runner_strategy.strategy, "Failed to start strategy — exchange runners continue");
+            }
+        }
+    } else {
+        info!("No [runner.strategies] configured — running exchange runners only");
+    }
+
+    tokio::select! {
+        _ = async {
+            for handle in exchange_handles {
+                if let Err(e) = handle.await {
+                    error!(error = %e, "Exchange runner task failed");
+                }
+            }
+        } => {}
+        _ = async {
+            if let Some(h) = strategy_handle {
+                if let Err(e) = h.await {
+                    error!(error = %e, "Strategy runner task failed");
+                }
+            } else {
+                // No strategy — just pend forever (Ctrl-C will break)
+                warn!("No strategy runner — awaiting Ctrl-C to exit");
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = tokio::signal::ctrl_c() => {
+            info!("Ctrl-C received — shutting down");
+        }
+    }
+
+    Ok(())
 }

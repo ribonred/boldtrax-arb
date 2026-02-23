@@ -27,7 +27,17 @@ impl AppConfig {
             }
         }
 
-        // 4. Environment Variables (highest precedence)
+        // 4. Strategy-specific configs (git-ignored)
+        if let Ok(entries) = std::fs::read_dir("config/strategies") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                    figment = figment.merge(Toml::file(path));
+                }
+            }
+        }
+
+        // 5. Environment Variables (highest precedence)
         figment = figment.merge(Env::prefixed("BOLDTRAX_").split("__"));
 
         let config: AppConfig = figment.extract()?;

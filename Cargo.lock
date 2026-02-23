@@ -208,7 +208,10 @@ dependencies = [
  "exchanges",
  "inquire",
  "rust_decimal",
+ "rustyline",
  "serde",
+ "strategies",
+ "strum",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -2495,14 +2498,17 @@ name = "strategies"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "boldtrax-core",
- "clap",
+ "chrono",
  "rust_decimal",
- "rustyline",
+ "rust_decimal_macros",
+ "serde",
  "strum",
+ "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

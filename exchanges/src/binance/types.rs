@@ -433,6 +433,8 @@ pub enum BinanceSpotUserDataEvent {
 pub struct BinanceSpotExecutionReport {
     #[serde(rename = "s")]
     pub symbol: String,
+    #[serde(rename = "i")]
+    pub order_id: u64,
     #[serde(rename = "c")]
     pub client_order_id: String,
     #[serde(rename = "S")]
@@ -504,6 +506,8 @@ pub struct BinanceFuturesWsPosition {
 pub struct BinanceFuturesOrderTradeUpdate {
     #[serde(rename = "s")]
     pub symbol: String,
+    #[serde(rename = "i")]
+    pub order_id: u64,
     #[serde(rename = "c")]
     pub client_order_id: String,
     #[serde(rename = "S")]
@@ -580,7 +584,12 @@ pub struct BinanceOrderResponse {
     /// Order creation time (ms). Present on query/cancel responses.
     #[serde(default)]
     pub time: Option<i64>,
-    pub update_time: i64,
+    /// Present on Futures responses and query endpoints.
+    #[serde(default)]
+    pub update_time: Option<i64>,
+    /// Present on Spot POST responses (`transactTime`).
+    #[serde(default)]
+    pub transact_time: Option<i64>,
     /// Average fill price – Futures field (`avgPrice`).
     #[serde(default)]
     pub avg_price: Option<String>,
@@ -588,6 +597,19 @@ pub struct BinanceOrderResponse {
     /// Used to compute the average fill price for spot orders.
     #[serde(default)]
     pub cummulative_quote_qty: Option<String>,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Leverage REST types
+// ──────────────────────────────────────────────────────────────────
+
+/// Response from `POST /fapi/v1/leverage`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceLeverageResponse {
+    pub symbol: String,
+    pub leverage: u32,
+    pub max_notional_value: String,
 }
 
 // ──────────────────────────────────────────────────────────────────

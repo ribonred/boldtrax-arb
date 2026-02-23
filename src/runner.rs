@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use boldtrax_core::config::types::AppConfig;
 use boldtrax_core::manager::account::{
     AccountManager, AccountManagerActor, AccountManagerConfig, AccountManagerHandle,
     AccountSnapshotSource,
@@ -20,8 +21,8 @@ use boldtrax_core::manager::price::{
 };
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
-    FundingRateMarketData, MarketDataProvider, OrderBookFeeder, OrderExecutionProvider,
-    PositionProvider,
+    FundingRateMarketData, LeverageProvider, MarketDataProvider, OrderBookFeeder,
+    OrderExecutionProvider, PositionProvider,
 };
 use boldtrax_core::types::{Exchange, ExecutionMode, InstrumentKey};
 use thiserror::Error;
@@ -29,6 +30,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use boldtrax_core::zmq::discovery::DiscoveryClient;
 use boldtrax_core::zmq::protocol::ZmqEvent;
 use boldtrax_core::zmq::server::{ZmqServer, ZmqServerConfig};
 
@@ -97,6 +99,63 @@ impl Default for ExchangeRunnerConfig {
     }
 }
 
+impl ExchangeRunnerConfig {
+    pub fn from_app_config(
+        app_config: &AppConfig,
+        exchange: Exchange,
+        tracked_keys: Vec<InstrumentKey>,
+    ) -> Self {
+        let rc = &app_config.runner;
+        let mgrs = &rc.managers;
+
+        let account_manager_config = AccountManagerConfig {
+            mailbox_capacity: mgrs.account.mailbox_capacity,
+            snapshot_max_age: chrono::Duration::seconds(mgrs.account.snapshot_max_age_secs as i64),
+        };
+
+        let price_manager_config = PriceManagerConfig {
+            mailbox_capacity: mgrs.price.mailbox_capacity,
+            event_broadcast_capacity: mgrs.price.broadcast_capacity,
+            ws_channel_capacity: mgrs.price.ws_capacity,
+            max_capacity: mgrs.price.max_cache_entries,
+            time_to_live: Duration::from_secs(mgrs.price.ttl_secs),
+        };
+
+        let order_manager_config = OrderManagerConfig {
+            mailbox_capacity: mgrs.order.mailbox_capacity,
+            event_broadcast_capacity: mgrs.order.broadcast_capacity,
+            ws_channel_capacity: mgrs.order.ws_capacity,
+            reconcile_interval: Duration::from_secs(mgrs.order.reconcile_interval_secs),
+            fat_finger: app_config.risk.fat_finger.clone(),
+        };
+
+        let position_manager_config = PositionManagerConfig {
+            mailbox_capacity: mgrs.position.mailbox_capacity,
+            event_broadcast_capacity: mgrs.position.broadcast_capacity,
+            reconcile_interval: Duration::from_secs(mgrs.position.reconcile_interval_secs),
+        };
+
+        let zmq_config = ZmqServerConfig {
+            exchange,
+            redis_url: app_config.redis_url.clone(),
+            ttl_secs: rc.zmq_ttl_secs,
+        };
+
+        Self {
+            exchange,
+            execution_mode: app_config.execution_mode,
+            account_reconcile_interval: rc.account_reconcile_interval(),
+            funding_rate_poll_interval: rc.funding_rate_poll_interval(),
+            tracked_keys,
+            account_manager_config,
+            price_manager_config,
+            order_manager_config,
+            position_manager_config,
+            zmq_config,
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Runner
 // ──────────────────────────────────────────────────────────────────────────────
@@ -124,6 +183,7 @@ where
         + OrderBookFeeder
         + OrderExecutionProvider
         + PositionProvider
+        + LeverageProvider
         + Send
         + Sync
         + 'static,
@@ -160,6 +220,17 @@ where
             mode = ?self.config.execution_mode,
             "Starting ExchangeRunner"
         );
+
+        // Clear stale ZMQ discovery keys from a previous run so that
+        // poll_until_ready won't find dead endpoints.
+        if let Ok(discovery) = DiscoveryClient::new(&self.config.zmq_config.redis_url) {
+            if let Err(e) = discovery.deregister_all(self.config.exchange).await {
+                warn!(error = %e, "Failed to deregister stale ZMQ endpoints — continuing");
+            } else {
+                info!(exchange = ?self.config.exchange, "Cleared stale ZMQ discovery keys");
+            }
+        }
+
         info!(exchange = ?self.config.exchange, "Loading instruments");
         self.client
             .load_instruments()
@@ -192,6 +263,7 @@ where
             Arc::clone(&self.client),
             self.registry.clone(),
             self.config.order_manager_config.clone(),
+            Some(price_handle.subscribe_updates()),
         );
         info!(exchange = ?self.config.exchange, "OrderManagerActor spawned");
 
@@ -204,14 +276,20 @@ where
 
         let (zmq_tx, zmq_rx) = broadcast::channel(1024);
 
-        let zmq_server = ZmqServer::new(
+        let zmq_server = ZmqServer::builder(
             self.config.zmq_config.clone(),
-            Some(order_handle.clone()),
-            Some(position_handle.clone()),
-            Some(account_handle.clone()),
             self.registry.clone(),
             zmq_rx,
-        );
+        )
+        .order_handle(order_handle.clone())
+        .position_handle(position_handle.clone())
+        .account_handle(account_handle.clone())
+        .price_handle(price_handle.clone())
+        .leverage_provider(Arc::clone(&self.client) as Arc<dyn LeverageProvider>)
+        .funding_rate_provider(
+            Arc::clone(&self.client) as Arc<dyn FundingRateMarketData + Send + Sync>
+        )
+        .build();
 
         let zmq_task = tokio::spawn(async move {
             if let Err(e) = zmq_server.run().await {

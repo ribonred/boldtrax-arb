@@ -59,7 +59,7 @@ fn full_setup() -> anyhow::Result<()> {
         _ => ExecutionMode::Paper,
     };
 
-    let (redis_url, update_interval_ms) = app::prompt_app_config()?;
+    let redis_url = app::prompt_app_config()?;
     let risk = risk::prompt_risk_config()?;
 
     let exchanges = std::collections::HashMap::new();
@@ -76,9 +76,9 @@ fn full_setup() -> anyhow::Result<()> {
     let config = AppConfig {
         execution_mode,
         redis_url,
-        update_interval_ms,
         risk,
-        exchanges, // This will be empty in local.toml, as exchanges are saved separately
+        exchanges,
+        ..Default::default()
     };
 
     let toml_string = toml::to_string_pretty(&config)?;
@@ -89,7 +89,7 @@ fn full_setup() -> anyhow::Result<()> {
 }
 
 fn configure_app() -> anyhow::Result<()> {
-    let (redis_url, update_interval_ms) = app::prompt_app_config()?;
+    let redis_url = app::prompt_app_config()?;
 
     let mut config = if Path::new("config/local.toml").exists() {
         let content = fs::read_to_string("config/local.toml")?;
@@ -99,7 +99,6 @@ fn configure_app() -> anyhow::Result<()> {
     };
 
     config.redis_url = redis_url;
-    config.update_interval_ms = update_interval_ms;
 
     let toml_string = toml::to_string_pretty(&config)?;
     fs::write("config/local.toml", toml_string)?;

@@ -1,39 +1,29 @@
-mod manual;
+//! Interactive REPL for manual trading via ZMQ.
+//!
+//! Moved from the old `strategies/src/main.rs` into the main binary
+//! so all entry points live in one place.
+
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use boldtrax_core::FundingRateSnapshot;
+use boldtrax_core::config::types::AppConfig;
 use boldtrax_core::types::{
     Exchange, InstrumentKey, InstrumentType, OrderRequest, OrderSide, OrderType, Pairs,
 };
 use boldtrax_core::zmq::protocol::ZmqEvent;
-use clap::Parser;
-use manual::ManualStrategy;
 use rust_decimal::Decimal;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use strategies::manual::ManualStrategy;
 use tracing::info;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(short, long, default_value = "redis://127.0.0.1:6379")]
-    redis_url: String,
+pub async fn run_manual(app_config: &AppConfig, exchange: Exchange) -> Result<()> {
+    info!("Starting Manual Strategy REPL for {:?}", exchange);
 
-    #[arg(short, long, default_value = "binance")]
-    exchange: Exchange,
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
-    let args = Args::parse();
-    info!("Starting Manual Strategy REPL for {:?}", args.exchange);
-
-    let mut strategy = ManualStrategy::new(&args.redis_url, args.exchange).await?;
+    let mut strategy = ManualStrategy::new(&app_config.redis_url, exchange).await?;
     let mut event_rx = strategy.subscribe();
     let fundingrate_store: Arc<RwLock<HashMap<InstrumentKey, FundingRateSnapshot>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -46,9 +36,7 @@ async fn main() -> Result<()> {
                 ZmqEvent::OrderUpdate(update) => {
                     println!("\n[EVENT] Order Update: {:?}", update);
                 }
-                ZmqEvent::Trade(_trade) => {
-                    // println!("\n[EVENT] Trade: {:?}", trade);
-                }
+                ZmqEvent::Trade(_trade) => {}
                 ZmqEvent::PositionUpdate(pos) => {
                     println!("\n[EVENT] Position Update: {:?}", pos);
                 }
@@ -57,7 +45,7 @@ async fn main() -> Result<()> {
                         funding.insert(snap.key, snap);
                     }
                 }
-                _ => {} // Ignore other events for now to avoid spam
+                _ => {}
             }
         }
     });
@@ -82,6 +70,7 @@ async fn main() -> Result<()> {
                         println!("  positions");
                         println!("  position <pair> <type>");
                         println!("  instruments");
+                        println!("  fundingrate <instrument_key>");
                         println!("  buy <pair> <type> <size> [price]");
                         println!("  sell <pair> <type> <size> [price]");
                         println!("  cancel <order_id>");
@@ -134,7 +123,7 @@ async fn main() -> Result<()> {
                             }
                         };
                         let key = InstrumentKey {
-                            exchange: args.exchange,
+                            exchange,
                             pair,
                             instrument_type,
                         };
@@ -198,7 +187,7 @@ async fn main() -> Result<()> {
 
                         let req = OrderRequest {
                             key: InstrumentKey {
-                                exchange: args.exchange,
+                                exchange,
                                 pair,
                                 instrument_type,
                             },
@@ -207,6 +196,8 @@ async fn main() -> Result<()> {
                             order_type,
                             price,
                             size,
+                            post_only: false,
+                            reduce_only: false,
                         };
 
                         match strategy.submit_order(req).await {

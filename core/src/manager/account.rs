@@ -258,10 +258,6 @@ where
         }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Core routing helpers
-    // ──────────────────────────────────────────────────────────────────────────
-
     async fn handle_command(&mut self, command: AccountCommand) {
         let exchange = Self::command_exchange(&command);
 

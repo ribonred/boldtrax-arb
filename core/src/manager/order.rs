@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -8,9 +9,18 @@ use rust_decimal::Decimal;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::config::types::FatFingerConfig;
 use crate::registry::InstrumentRegistry;
 use crate::traits::{OrderExecutionProvider, TradingError};
-use crate::types::{Exchange, Order, OrderEvent, OrderRequest, OrderStatus};
+use crate::types::{
+    Exchange, InstrumentKey, Order, OrderBookSnapshot, OrderBookUpdate, OrderEvent, OrderRequest,
+    OrderStatus, OrderType,
+};
+
+/// Process-wide monotonic counter to disambiguate orders created in the same
+/// millisecond. Wraps at `u32::MAX` which is fine — the combination of
+/// `timestamp_ms + seq` is practically unique.
+static ORDER_SEQ: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
 pub struct OrderManagerConfig {
@@ -18,6 +28,7 @@ pub struct OrderManagerConfig {
     pub event_broadcast_capacity: usize,
     pub ws_channel_capacity: usize,
     pub reconcile_interval: Duration,
+    pub fat_finger: FatFingerConfig,
 }
 
 impl Default for OrderManagerConfig {
@@ -27,6 +38,7 @@ impl Default for OrderManagerConfig {
             event_broadcast_capacity: 1024,
             ws_channel_capacity: 1024,
             reconcile_interval: Duration::from_secs(30),
+            fat_finger: FatFingerConfig::default(),
         }
     }
 }
@@ -98,6 +110,9 @@ pub struct OrderManagerActor<P> {
     exchange: Exchange,
     provider: Arc<P>,
     registry: InstrumentRegistry,
+    fat_finger: FatFingerConfig,
+    price_rx: Option<broadcast::Receiver<OrderBookUpdate>>,
+    price_cache: HashMap<InstrumentKey, OrderBookSnapshot>,
     cmd_tx: mpsc::Sender<OrderCommand>,
     cmd_rx: mpsc::Receiver<OrderCommand>,
     ws_rx: mpsc::Receiver<OrderEvent>,
@@ -115,6 +130,7 @@ where
         provider: Arc<P>,
         registry: InstrumentRegistry,
         config: OrderManagerConfig,
+        price_rx: Option<broadcast::Receiver<OrderBookUpdate>>,
     ) -> OrderManagerHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.mailbox_capacity);
         let (ws_tx, ws_rx) = mpsc::channel(config.ws_channel_capacity);
@@ -124,6 +140,9 @@ where
             exchange,
             provider: Arc::clone(&provider),
             registry,
+            fat_finger: config.fat_finger.clone(),
+            price_rx,
+            price_cache: HashMap::new(),
             cmd_tx: cmd_tx.clone(),
             cmd_rx,
             ws_rx,
@@ -169,6 +188,70 @@ where
         }
     }
 
+    fn check_fat_finger(&self, req: &OrderRequest) -> Result<(), TradingError> {
+        // post_only is only valid on Limit orders
+        if req.post_only && req.order_type != OrderType::Limit {
+            return Err(TradingError::InvalidPostOnly);
+        }
+
+        // Max single-order size in base asset units
+        if req.size > self.fat_finger.max_order_size {
+            return Err(TradingError::MaxOrderSizeExceeded {
+                requested: req.size,
+                max: self.fat_finger.max_order_size,
+            });
+        }
+
+        // Max order notional: use limit price when available, otherwise require a live mid
+        let notional = if let Some(price) = req.price {
+            price * req.size
+        } else {
+            let mid = self
+                .price_cache
+                .get(&req.key)
+                .and_then(|snap| snap.mid)
+                .ok_or(TradingError::PriceNotReady)?;
+            mid * req.size
+        };
+
+        if notional > self.fat_finger.max_order_notional_usd {
+            return Err(TradingError::MaxNotionalExceeded {
+                requested: notional,
+                max: self.fat_finger.max_order_notional_usd,
+            });
+        }
+
+        // Price band: Limit price must not deviate too far from current mid.
+        // Require a live, non-zero mid — silently skipping would hide stale data.
+        if let Some(limit_price) = req.price {
+            let mid = self
+                .price_cache
+                .get(&req.key)
+                .and_then(|snap| snap.mid)
+                .filter(|m| !m.is_zero())
+                .ok_or(TradingError::PriceNotReady)?;
+
+            let deviation_pct = ((limit_price - mid).abs() / mid) * Decimal::new(100, 0);
+            if deviation_pct > self.fat_finger.max_price_deviation_pct {
+                return Err(TradingError::PriceBandViolation {
+                    deviation_pct,
+                    max_pct: self.fat_finger.max_price_deviation_pct,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn recv_price(
+        rx: &mut Option<broadcast::Receiver<OrderBookUpdate>>,
+    ) -> Result<OrderBookUpdate, broadcast::error::RecvError> {
+        match rx {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
     async fn run(&mut self) {
         info!(exchange = ?self.exchange, "OrderManagerActor started");
 
@@ -179,6 +262,9 @@ where
                 }
                 Some(event) = self.ws_rx.recv() => {
                     self.handle_ws_event(event).await;
+                }
+                Ok(update) = Self::recv_price(&mut self.price_rx) => {
+                    self.price_cache.insert(update.snapshot.key, update.snapshot);
                 }
                 else => {
                     info!(exchange = ?self.exchange, "OrderManagerActor shutting down");
@@ -245,17 +331,23 @@ where
             });
         }
 
+        self.check_fat_finger(&normalized_req)?;
+
         let timestamp_ms = Utc::now().timestamp_millis();
+        let seq = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut internal_id = String::with_capacity(64);
         write!(
             internal_id,
-            "{}-{}-{}",
+            "{}-{}-{}-{}",
             normalized_req.strategy_id,
             timestamp_ms,
-            self.exchange.short_code()
+            self.exchange.short_code(),
+            seq,
         )
         .unwrap();
-        let client_order_id = self.provider.format_client_id(&internal_id);
+        let client_order_id = self
+            .provider
+            .encode_client_order_id(&internal_id, &normalized_req.strategy_id);
 
         let now = Utc::now();
         let pending_order = Order {
@@ -362,15 +454,17 @@ where
                 // The REST call failed.
                 error!(internal_id = %internal_id, error = %e, "REST submit failed");
                 if let Some(mut order) = self.active_orders.remove(&internal_id) {
-                    // Only reject if it hasn't been partially filled by WS already
-                    if order.is_pending_or_new() {
+                    // Only reject if WS hasn't confirmed the order yet.
+                    // If WS already moved status to New (or beyond), the exchange accepted
+                    // the order — a REST parse error is a client-side issue, not a rejection.
+                    if order.is_pending_submit() {
                         order.mark_rejected();
                         self.client_id_map.remove(&order.client_order_id);
                         let _ = self.event_tx.send(order.clone().into());
                     } else {
-                        // It was partially filled by WS before REST returned an error?
-                        // This is a weird edge case (e.g. timeout on REST but exchange accepted it).
-                        warn!(internal_id = %internal_id, "REST failed but order has WS updates, keeping active");
+                        // WS already confirmed this order (New, PartiallyFilled, etc.).
+                        // Keep it active — the exchange accepted it.
+                        warn!(internal_id = %internal_id, status = ?order.status, "REST failed but WS confirmed order, keeping active");
                         self.active_orders.insert(internal_id, order);
                     }
                 }
@@ -409,13 +503,13 @@ where
             if let Some(id) = self.client_id_map.get(&exchange_order.client_order_id) {
                 id.clone()
             } else {
-                error!(
+                warn!(
                     client_order_id = %exchange_order.client_order_id,
                     key = ?exchange_order.request.key,
                     status = %exchange_order.status,
-                    "FATAL: WS event for unknown client_order_id — order placed outside strategy"
+                    "WS event for unknown client_order_id — ignoring (likely external order)"
                 );
-                std::process::abort();
+                return;
             }
         } else {
             exchange_order.internal_id.clone()
@@ -425,14 +519,14 @@ where
         let mut internal_order = if let Some(order) = self.active_orders.get(&internal_id) {
             order.clone()
         } else {
-            error!(
+            warn!(
                 internal_id = %internal_id,
                 client_order_id = %exchange_order.client_order_id,
                 key = ?exchange_order.request.key,
                 status = %exchange_order.status,
-                "FATAL: WS event for untracked order — state lost or order executed outside strategy"
+                "WS event for untracked order — ignoring (already completed or external)"
             );
-            std::process::abort();
+            return;
         };
 
         // Mutate internal order with exchange order data

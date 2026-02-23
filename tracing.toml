@@ -49,6 +49,7 @@ directives = [
     # ── Application crates ────────────────────────────────────────────────────
     "boldtrax_core=debug",
     "exchanges=debug",
+    "strategies=debug",
     "boldtrax_bot=debug",
     "boldtrax_core::manager::price=info",
 

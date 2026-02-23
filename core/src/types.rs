@@ -434,7 +434,6 @@ pub enum OrderSide {
 pub enum OrderType {
     Market,
     Limit,
-    PostOnly,
 }
 
 #[derive(
@@ -469,6 +468,11 @@ pub struct OrderRequest {
     pub order_type: OrderType,
     pub price: Option<Decimal>,
     pub size: Decimal,
+    /// If true, the order will be canceled instead of matching immediately (Maker-only).
+    /// Only valid for `OrderType::Limit`.
+    pub post_only: bool,
+    /// If true, the order can only reduce an existing position, never open or increase one.
+    pub reduce_only: bool,
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
@@ -546,6 +550,8 @@ impl Default for Order {
                 order_type: OrderType::Market,
                 price: None,
                 size: Decimal::ZERO,
+                post_only: false,
+                reduce_only: false,
             },
             status: OrderStatus::PendingSubmit,
             filled_size: Decimal::ZERO,

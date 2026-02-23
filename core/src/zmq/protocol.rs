@@ -25,6 +25,12 @@ pub enum ZmqCommand {
     GetInstrument(InstrumentKey),
     /// Request all instruments for the exchange.
     GetAllInstruments,
+    /// Request the current reference price (mid price) for an instrument.
+    GetReferencePrice(InstrumentKey),
+    /// Set leverage for an instrument on the exchange.
+    SetLeverage(InstrumentKey, rust_decimal::Decimal),
+    /// Request the current funding rate snapshot for a swap instrument.
+    GetFundingRate(InstrumentKey),
 }
 
 /// Responses sent from the ExchangeRunner (ROUTER) back to the Strategy (DEALER).
@@ -46,6 +52,12 @@ pub enum ZmqResponse {
     Instrument(Option<Instrument>),
     /// Response containing all instruments.
     AllInstruments(Vec<Instrument>),
+    /// Response containing the reference price (mid price).
+    ReferencePrice(rust_decimal::Decimal),
+    /// Acknowledgment that leverage was set, returns actual leverage.
+    SetLeverageAck(rust_decimal::Decimal),
+    /// Response containing a funding rate snapshot.
+    FundingRate(FundingRateSnapshot),
     /// An error occurred while processing the command.
     Error(String),
 }

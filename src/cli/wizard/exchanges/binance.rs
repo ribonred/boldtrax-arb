@@ -1,4 +1,4 @@
-use super::ExchangeWizard;
+use super::{ExchangeWizard, prompt_instruments};
 use boldtrax_core::types::Exchange;
 use inquire::{Confirm, Text};
 
@@ -41,6 +41,12 @@ impl ExchangeWizard for BinanceWizard {
             if !spot_url.is_empty() {
                 map.insert("spot_base_url".to_string(), toml::Value::String(spot_url));
             }
+        }
+
+        // ── Instrument tracking ───────────────────────────────────────
+        let instruments = prompt_instruments(Exchange::Binance)?;
+        if !instruments.is_empty() {
+            map.insert("instruments".to_string(), toml::Value::Array(instruments));
         }
 
         Ok(toml::Value::Table(map))

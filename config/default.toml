@@ -1,6 +1,12 @@
 execution_mode = "paper"
 redis_url = "redis://127.0.0.1:6379"
-update_interval_ms = 1000
+
+[runner]
+exchanges = []
+account_reconcile_interval_secs = 30
+funding_rate_poll_interval_secs = 60
+zmq_ttl_secs = 30
+
 [risk]
 max_position_size = "1000"
 max_total_exposure = "5000"
@@ -9,3 +15,8 @@ delta_threshold = "0.05"
 min_funding_rate = "0.0001"
 max_negative_funding_rate = "-0.001"
 daily_drawdown_limit_pct = "5"
+
+[risk.fat_finger]
+max_order_size = "10"
+max_order_notional_usd = "100000"
+max_price_deviation_pct = "5"

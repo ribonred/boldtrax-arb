@@ -258,6 +258,19 @@ impl PositionManagerActor {
                     }
                 }
 
+                for pos in self.store.0.values() {
+                    let notional = pos.size * pos.entry_price;
+                    info!(
+                        key = %pos.key,
+                        size = %pos.size,
+                        entry_price = %pos.entry_price,
+                        notional = %notional,
+                        unrealized_pnl = %pos.unrealized_pnl,
+                        leverage = %pos.leverage,
+                        liquidation_price = ?pos.liquidation_price,
+                        "Position"
+                    );
+                }
                 debug!(count = self.store.0.len(), "Positions reconciled from REST");
             }
         }

@@ -106,6 +106,26 @@ impl DiscoveryClient {
         Ok(())
     }
 
+    /// Remove a service endpoint from Redis (e.g. on startup to clear stale entries).
+    pub async fn deregister(
+        &self,
+        exchange: Exchange,
+        service_type: ServiceType,
+    ) -> Result<(), redis::RedisError> {
+        let key = Self::build_key(exchange, service_type);
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let _: () = conn.del(&key).await?;
+        debug!(key = %key, "Deregistered ZMQ service from Redis");
+        Ok(())
+    }
+
+    /// Remove all service endpoints for an exchange (PUB + ROUTER).
+    pub async fn deregister_all(&self, exchange: Exchange) -> Result<(), redis::RedisError> {
+        self.deregister(exchange, ServiceType::Pub).await?;
+        self.deregister(exchange, ServiceType::Router).await?;
+        Ok(())
+    }
+
     /// Discovers a service endpoint from Redis.
     pub async fn discover_service(
         &self,

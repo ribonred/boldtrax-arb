@@ -1,14 +1,14 @@
 //! Binance exchange client
 
 use async_trait::async_trait;
-use boldtrax_core::http::{BinanceHmacAuth, HttpClientBuilder, TracedHttpClient};
+use boldtrax_core::http::{BinanceHmacAuth, HttpClientBuilder, ResponseExt, TracedHttpClient};
 use boldtrax_core::manager::account::{AccountManagerError, AccountSnapshotSource};
 use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
-    Account, AccountError, BaseInstrumentMeta, FundingRateMarketData, MarketDataError,
-    MarketDataProvider, OrderBookFeeder, OrderExecutionProvider, PositionProvider, PriceError,
-    TradingError,
+    Account, AccountError, BaseInstrumentMeta, FundingRateMarketData, LeverageProvider,
+    MarketDataError, MarketDataProvider, OrderBookFeeder, OrderExecutionProvider, PositionProvider,
+    PriceError, TradingError,
 };
 use boldtrax_core::types::{
     FundingInterval, FundingRateSeries, FundingRateSnapshot, Instrument, InstrumentKey,
@@ -16,12 +16,13 @@ use boldtrax_core::types::{
     Position,
 };
 use boldtrax_core::ws::{CancellationToken, ws_supervisor_spawn};
-use boldtrax_core::{AccountSnapshot, Exchange, OrderEvent};
+use boldtrax_core::{AccountSnapshot, Exchange, ExecutionMode, OrderEvent};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio::sync::{OnceCell, mpsc};
 use tracing::{debug, info};
 
+use crate::binance::codec::BinanceClientOrderIdCodec;
 use crate::binance::ws::{
     BinanceDepthPolicy, BinanceFuturesUserDataPolicy, BinanceSpotUserDataPolicy,
 };
@@ -33,9 +34,10 @@ use crate::binance::mappers::{
 };
 use crate::binance::types::{
     BinanceFundingInfo, BinanceFundingRateHistory, BinanceFuturesBalance,
-    BinanceFuturesExchangeInfo, BinanceFuturesPositionRisk, BinanceOrderResponse,
-    BinancePartialDepth, BinancePremiumIndex, BinanceServerTime, BinanceSpotAccount,
-    BinanceSpotBalance, BinanceSpotExchangeInfo, BinanceSpotMeta, BinanceSwapMeta,
+    BinanceFuturesExchangeInfo, BinanceFuturesPositionRisk, BinanceLeverageResponse,
+    BinanceOrderResponse, BinancePartialDepth, BinancePremiumIndex, BinanceServerTime,
+    BinanceSpotAccount, BinanceSpotBalance, BinanceSpotExchangeInfo, BinanceSpotMeta,
+    BinanceSwapMeta,
 };
 
 use boldtrax_core::config::types::ExchangeConfig;
@@ -49,7 +51,6 @@ const BINANCE_FUTURES_WS_BASE_URL: &str = "wss://fstream.binance.com";
 const BINANCE_SPOT_WS_BASE_URL: &str = "wss://stream.binance.com:9443";
 const BINANCE_FUTURES_WS_TESTNET_URL: &str = "wss://stream.binancefuture.com";
 const BINANCE_SPOT_WS_TESTNET_URL: &str = "wss://testnet.binance.vision:443";
-/// Binance WebSocket API endpoint for authenticated Spot user-data streams.
 const BINANCE_SPOT_WS_API_URL: &str = "wss://ws-api.binance.com:443/ws-api/v3";
 
 /// Binance API mode configuration
@@ -86,10 +87,38 @@ pub struct BinanceConfig {
     pub spot_base_url: Option<String>,
     #[serde(default)]
     pub testnet: bool,
+    /// Instruments to track for price feeds and funding-rate polling.
+    /// Each entry is an `InstrumentKey` string, e.g. `"SOLUSDT-BN-SWAP"`.
+    #[serde(default)]
+    pub instruments: Vec<String>,
 }
 
 impl ExchangeConfig for BinanceConfig {
     const EXCHANGE_NAME: &'static str = "binance";
+
+    fn validate(&self, execution_mode: ExecutionMode) {
+        if execution_mode == ExecutionMode::Live {
+            self.api_key
+                .as_ref()
+                .filter(|k| !k.is_empty())
+                .expect("binance: api_key required for Live mode");
+            self.api_secret
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .expect("binance: api_secret required for Live mode");
+        }
+    }
+}
+
+impl BinanceConfig {
+    /// Resolve configured instrument strings into typed `InstrumentKey`s.
+    /// Invalid entries are silently skipped (logged by caller).
+    pub fn tracked_keys(&self) -> Vec<InstrumentKey> {
+        self.instruments
+            .iter()
+            .filter_map(|s| s.parse::<InstrumentKey>().ok())
+            .collect()
+    }
 }
 
 impl Default for BinanceConfig {
@@ -103,6 +132,7 @@ impl Default for BinanceConfig {
             futures_base_url: None,
             spot_base_url: None,
             testnet: false,
+            instruments: vec![],
         }
     }
 }
@@ -118,6 +148,10 @@ pub struct BinanceClient {
     spot_private_client: Option<TracedHttpClient>,
     /// Ensures `load_instruments` only fetches once even under concurrent calls
     instruments_loaded: OnceCell<()>,
+    /// Per-instrument leverage set via `set_leverage`, keyed by `InstrumentKey`.
+    /// Used to populate the `leverage` field in positions fetched via REST
+    /// (Binance v3 `positionRisk` does not return leverage).
+    leverage_map: std::sync::RwLock<HashMap<InstrumentKey, rust_decimal::Decimal>>,
 }
 
 impl BinanceClient {
@@ -216,6 +250,7 @@ impl BinanceClient {
             futures_private_client,
             spot_private_client,
             instruments_loaded: OnceCell::new(),
+            leverage_map: std::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -515,13 +550,12 @@ impl AccountSnapshotSource for BinanceClient {
 
 #[async_trait]
 impl OrderExecutionProvider for BinanceClient {
-    fn format_client_id(&self, internal_id: &str) -> String {
-        // Binance allows up to 36 characters for clientOrderId
-        let mut id = internal_id.to_string();
-        if id.len() > 36 {
-            id.truncate(36);
-        }
-        id
+    fn encode_client_order_id(&self, internal_id: &str, strategy_id: &str) -> String {
+        BinanceClientOrderIdCodec.encode(internal_id, strategy_id)
+    }
+
+    fn decode_strategy_id(&self, client_order_id: &str) -> Option<String> {
+        BinanceClientOrderIdCodec.decode_strategy_id(client_order_id)
     }
 
     async fn place_order(
@@ -542,8 +576,8 @@ impl OrderExecutionProvider for BinanceClient {
         // LIMIT_MAKER is Binance's post-only order type.
         let (order_type, time_in_force) = match request.order_type {
             OrderType::Market => ("MARKET", None),
+            OrderType::Limit if request.post_only => ("LIMIT_MAKER", None),
             OrderType::Limit => ("LIMIT", Some("GTC")),
-            OrderType::PostOnly => ("LIMIT_MAKER", None),
         };
 
         let size = instrument.normalize_quantity(request.size);
@@ -561,6 +595,11 @@ impl OrderExecutionProvider for BinanceClient {
             params.push_str(&format!("&timeInForce={tif}"));
         }
 
+        // reduceOnly is only valid for futures, not spot.
+        if request.reduce_only && request.key.instrument_type == InstrumentType::Swap {
+            params.push_str("&reduceOnly=true");
+        }
+
         let key = request.key;
         let strategy_id = request.strategy_id.clone();
 
@@ -570,10 +609,8 @@ impl OrderExecutionProvider for BinanceClient {
                 let path = format!("/fapi/v1/order?{params}");
                 debug!(symbol = %symbol, side = side, order_type = order_type, "Placing Futures order");
                 let resp = client.post_empty(&path).await.map_err(TradingError::from)?;
-                let order_resp: BinanceOrderResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let order_resp: BinanceOrderResponse =
+                    resp.json_logged("futures place_order").await?;
                 binance_order_response_to_order(&order_resp, key, &strategy_id, &client_order_id)
                     .ok_or_else(|| {
                         TradingError::Parse(
@@ -582,14 +619,14 @@ impl OrderExecutionProvider for BinanceClient {
                     })
             }
             InstrumentType::Spot => {
+                // LIMIT_MAKER defaults to ACK response (missing price/qty/status fields).
+                // Force RESULT so we get the full response for all spot order types.
+                params.push_str("&newOrderRespType=RESULT");
                 let client = self.spot_private_client()?;
                 let path = format!("/api/v3/order?{params}");
                 debug!(symbol = %symbol, side = side, order_type = order_type, "Placing Spot order");
                 let resp = client.post_empty(&path).await.map_err(TradingError::from)?;
-                let order_resp: BinanceOrderResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let order_resp: BinanceOrderResponse = resp.json_logged("spot place_order").await?;
                 binance_order_response_to_order(&order_resp, key, &strategy_id, &client_order_id)
                     .ok_or_else(|| {
                         TradingError::Parse("failed to parse spot place_order response".to_string())
@@ -615,10 +652,8 @@ impl OrderExecutionProvider for BinanceClient {
                 let path = format!("/fapi/v1/order?symbol={symbol}&origClientOrderId={order_id}");
                 debug!(symbol = %symbol, order_id = order_id, "Canceling Futures order");
                 let resp = client.delete(&path).await.map_err(TradingError::from)?;
-                let order_resp: BinanceOrderResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let order_resp: BinanceOrderResponse =
+                    resp.json_logged("futures cancel_order").await?;
                 binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
                     TradingError::Parse("failed to parse futures cancel_order response".to_string())
                 })
@@ -628,10 +663,8 @@ impl OrderExecutionProvider for BinanceClient {
                 let path = format!("/api/v3/order?symbol={symbol}&origClientOrderId={order_id}");
                 debug!(symbol = %symbol, order_id = order_id, "Canceling Spot order");
                 let resp = client.delete(&path).await.map_err(TradingError::from)?;
-                let order_resp: BinanceOrderResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let order_resp: BinanceOrderResponse =
+                    resp.json_logged("spot cancel_order").await?;
                 binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
                     TradingError::Parse("failed to parse spot cancel_order response".to_string())
                 })
@@ -652,10 +685,8 @@ impl OrderExecutionProvider for BinanceClient {
                 let path = format!("/fapi/v1/openOrders?symbol={symbol}");
                 debug!(symbol = %symbol, "Fetching Futures open orders");
                 let resp = client.get(&path).await.map_err(TradingError::from)?;
-                let orders: Vec<BinanceOrderResponse> = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let orders: Vec<BinanceOrderResponse> =
+                    resp.json_logged("futures get_open_orders").await?;
                 Ok(orders
                     .iter()
                     .filter_map(|o| binance_order_response_to_order(o, key, "", &o.client_order_id))
@@ -666,10 +697,8 @@ impl OrderExecutionProvider for BinanceClient {
                 let path = format!("/api/v3/openOrders?symbol={symbol}");
                 debug!(symbol = %symbol, "Fetching Spot open orders");
                 let resp = client.get(&path).await.map_err(TradingError::from)?;
-                let orders: Vec<BinanceOrderResponse> = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let orders: Vec<BinanceOrderResponse> =
+                    resp.json_logged("spot get_open_orders").await?;
                 Ok(orders
                     .iter()
                     .filter_map(|o| binance_order_response_to_order(o, key, "", &o.client_order_id))
@@ -695,10 +724,8 @@ impl OrderExecutionProvider for BinanceClient {
                 let path = format!("/fapi/v1/order?symbol={symbol}&origClientOrderId={order_id}");
                 debug!(symbol = %symbol, order_id = order_id, "Querying Futures order status");
                 let resp = client.get(&path).await.map_err(TradingError::from)?;
-                let order_resp: BinanceOrderResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let order_resp: BinanceOrderResponse =
+                    resp.json_logged("futures get_order_status").await?;
                 binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
                     TradingError::Parse("failed to parse futures order status response".to_string())
                 })
@@ -708,10 +735,8 @@ impl OrderExecutionProvider for BinanceClient {
                 let path = format!("/api/v3/order?symbol={symbol}&origClientOrderId={order_id}");
                 debug!(symbol = %symbol, order_id = order_id, "Querying Spot order status");
                 let resp = client.get(&path).await.map_err(TradingError::from)?;
-                let order_resp: BinanceOrderResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| TradingError::Parse(e.to_string()))?;
+                let order_resp: BinanceOrderResponse =
+                    resp.json_logged("spot get_order_status").await?;
                 binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
                     TradingError::Parse("failed to parse spot order status response".to_string())
                 })
@@ -819,6 +844,22 @@ impl PositionProvider for BinanceClient {
             })
             .collect();
 
+        // Apply stored leverage — Binance v3 positionRisk does not return
+        // leverage, so we overlay values from our in-memory leverage map.
+        let leverage_map = self
+            .leverage_map
+            .read()
+            .expect("leverage_map lock poisoned");
+        let positions = positions
+            .into_iter()
+            .map(|mut pos| {
+                if let Some(&lev) = leverage_map.get(&pos.key) {
+                    pos.leverage = lev;
+                }
+                pos
+            })
+            .collect();
+
         Ok(positions)
     }
 
@@ -854,6 +895,62 @@ impl PositionProvider for BinanceClient {
         handle.join().await;
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl LeverageProvider for BinanceClient {
+    async fn set_leverage(
+        &self,
+        key: InstrumentKey,
+        leverage: rust_decimal::Decimal,
+    ) -> Result<rust_decimal::Decimal, TradingError> {
+        let instrument = self
+            .registry
+            .get(&key)
+            .ok_or_else(|| TradingError::Other(format!("instrument not found: {key}")));
+        let symbol = instrument?.exchange_symbol;
+
+        let client = self.futures_private_client()?;
+        let leverage_int = leverage.to_string();
+        let path = format!("/fapi/v1/leverage?symbol={symbol}&leverage={leverage_int}");
+
+        debug!(symbol = %symbol, leverage = %leverage, "Setting Binance leverage");
+        let resp = client.post_empty(&path).await.map_err(TradingError::from)?;
+        let result: BinanceLeverageResponse = resp
+            .json()
+            .await
+            .map_err(|e| TradingError::Parse(e.to_string()))?;
+
+        let actual = rust_decimal::Decimal::from(result.leverage);
+        info!(
+            symbol = %symbol,
+            requested = %leverage,
+            actual = %actual,
+            max_notional = %result.max_notional_value,
+            "Leverage set on Binance"
+        );
+
+        // Store for use when reconciling positions from REST.
+        self.leverage_map
+            .write()
+            .expect("leverage_map lock poisoned")
+            .insert(key, actual);
+
+        Ok(actual)
+    }
+
+    async fn get_leverage(
+        &self,
+        key: InstrumentKey,
+    ) -> Result<Option<rust_decimal::Decimal>, TradingError> {
+        let stored = self
+            .leverage_map
+            .read()
+            .expect("leverage_map lock poisoned")
+            .get(&key)
+            .copied();
+        Ok(stored)
     }
 }
 
@@ -1014,6 +1111,7 @@ mod tests {
             futures_base_url: Some(mock_server.uri()),
             spot_base_url: Some(mock_server.uri()),
             testnet: false,
+            instruments: vec![],
         };
         BinanceClient::new(config, registry).expect("Failed to create test client")
     }
@@ -1319,6 +1417,7 @@ mod tests {
             futures_base_url: Some(mock_server.uri()),
             spot_base_url: Some(mock_server.uri()),
             testnet: false,
+            instruments: vec![],
         };
         let client =
             BinanceClient::new(config, empty_registry()).expect("client should be created");

@@ -9,6 +9,7 @@ members = ["core", "exchanges", "strategies"]
 [dependencies]
 boldtrax-core = { path = "./core" }
 exchanges = { path = "./exchanges" }
+strategies = { path = "./strategies" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 tracing = { version = "0.1", features = ["max_level_trace", "release_max_level_info"] }
@@ -21,3 +22,5 @@ inquire = "0.7"
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 rust_decimal = "1"
+rustyline = "14.0"
+strum = { version = "0.26", features = ["derive"] }

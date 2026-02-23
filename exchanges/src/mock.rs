@@ -3,7 +3,7 @@ use boldtrax_core::manager::account::{AccountManagerError, AccountSnapshotSource
 use boldtrax_core::manager::types::{AccountModel, AccountSnapshot, BalanceView, CollateralScope};
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
-    FundingRateMarketData, MarketDataError, MarketDataProvider, OrderBookFeeder,
+    FundingRateMarketData, LeverageProvider, MarketDataError, MarketDataProvider, OrderBookFeeder,
     OrderExecutionProvider, PositionProvider, PriceError, TradingError,
 };
 use boldtrax_core::types::{
@@ -22,6 +22,7 @@ pub struct MockState {
     pub balances: HashMap<Currency, BalanceView>,
     pub positions: HashMap<InstrumentKey, Position>,
     pub open_orders: HashMap<String, Order>,
+    pub leverage_map: HashMap<InstrumentKey, Decimal>,
 }
 
 impl Default for MockState {
@@ -48,6 +49,7 @@ impl Default for MockState {
             balances,
             positions: HashMap::new(),
             open_orders: HashMap::new(),
+            leverage_map: HashMap::new(),
         }
     }
 }
@@ -161,8 +163,20 @@ impl<T: Send + Sync> AccountSnapshotSource for MockExchange<T> {
 
 #[async_trait]
 impl<T: OrderBookFeeder + Send + Sync> OrderExecutionProvider for MockExchange<T> {
-    fn format_client_id(&self, internal_id: &str) -> String {
+    fn encode_client_order_id(&self, internal_id: &str, _strategy_id: &str) -> String {
         format!("mock-{}", internal_id)
+    }
+
+    fn decode_strategy_id(&self, client_order_id: &str) -> Option<String> {
+        // mock-{strategy_id}-{ts_ms}-{short_code} -> Extract strategy_id segment
+        let stripped = client_order_id
+            .strip_prefix("mock-")
+            .unwrap_or(client_order_id);
+        stripped
+            .split('-')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
     }
 
     async fn place_order(
@@ -205,7 +219,6 @@ impl<T: OrderBookFeeder + Send + Sync> OrderExecutionProvider for MockExchange<T
                 OrderSide::Buy => request.price.unwrap_or(Decimal::ZERO) >= fill_price,
                 OrderSide::Sell => request.price.unwrap_or(Decimal::MAX) <= fill_price,
             },
-            OrderType::PostOnly => false, // Simplified
         };
 
         if is_marketable {
@@ -242,6 +255,11 @@ impl<T: OrderBookFeeder + Send + Sync> OrderExecutionProvider for MockExchange<T
             }
 
             // Update positions
+            let leverage = state
+                .leverage_map
+                .get(&request.key)
+                .copied()
+                .unwrap_or(Decimal::ONE);
             let position = state
                 .positions
                 .entry(request.key)
@@ -250,7 +268,7 @@ impl<T: OrderBookFeeder + Send + Sync> OrderExecutionProvider for MockExchange<T
                     size: Decimal::ZERO,
                     entry_price: Decimal::ZERO,
                     unrealized_pnl: Decimal::ZERO,
-                    leverage: Decimal::ONE,
+                    leverage,
                     liquidation_price: None,
                 });
 
@@ -362,6 +380,28 @@ impl<T: Send + Sync> PositionProvider for MockExchange<T> {
     }
 }
 
+#[async_trait]
+impl<T: Send + Sync> LeverageProvider for MockExchange<T> {
+    async fn set_leverage(
+        &self,
+        key: InstrumentKey,
+        leverage: Decimal,
+    ) -> Result<Decimal, TradingError> {
+        let mut state = self.state.write().await;
+        state.leverage_map.insert(key, leverage);
+        // Also update any existing position's leverage
+        if let Some(pos) = state.positions.get_mut(&key) {
+            pos.leverage = leverage;
+        }
+        Ok(leverage)
+    }
+
+    async fn get_leverage(&self, key: InstrumentKey) -> Result<Option<Decimal>, TradingError> {
+        let state = self.state.read().await;
+        Ok(state.leverage_map.get(&key).copied())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +458,8 @@ mod tests {
             order_type: OrderType::Market,
             price: None,
             size: dec!(1.0),
+            post_only: false,
+            reduce_only: false,
             strategy_id: "test_strategy".to_string(),
         };
 

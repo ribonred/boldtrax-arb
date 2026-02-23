@@ -1,4 +1,4 @@
-use super::ExchangeWizard;
+use super::{ExchangeWizard, prompt_instruments};
 use boldtrax_core::types::Exchange;
 use inquire::{Confirm, Text};
 
@@ -28,6 +28,12 @@ impl ExchangeWizard for OkxWizard {
         }
         if !passphrase.is_empty() {
             map.insert("passphrase".to_string(), toml::Value::String(passphrase));
+        }
+
+        // ── Instrument tracking ───────────────────────────────────────
+        let instruments = prompt_instruments(Exchange::Okx)?;
+        if !instruments.is_empty() {
+            map.insert("instruments".to_string(), toml::Value::Array(instruments));
         }
 
         Ok(toml::Value::Table(map))

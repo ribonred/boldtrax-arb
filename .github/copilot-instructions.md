@@ -49,6 +49,17 @@ Every exchange implementation must:
 - Track both REST API calls and WebSocket events
 - Never block on metrics collection
 
+### REST Response Parsing (`ResponseExt`)
+All order-critical REST calls MUST use the `ResponseExt` trait from `core/src/http/client.rs`, NOT bare `.json()`. This ensures raw response bodies are always logged on parse failure.
+
+- **`resp.json_logged(context)`** — Reads body as text, parses JSON. Logs full raw body at ERROR on failure. Use for standard API calls.
+- **`check_and_parse(resp, context, is_error)`** — Free async function. Reads body, runs `fn(&str) -> Option<String>` error detector (catches HTTP 200 with error payload like Kraken/Binance edge cases), then parses JSON. Use for exchanges that embed errors in 200 responses.
+- **`resp.text_logged(context)`** — Returns `(body, StatusCode)` for full manual control.
+
+Design note: `check_and_parse` is a free function (not on the trait) because `async_trait` has lifetime issues with `fn(&str)` pointer parameters.
+
+When adding a new exchange connector, always use `json_logged` for order endpoints at minimum. If the exchange is known to return 200 with error payloads, write an `fn(&str) -> Option<String>` detector and use `check_and_parse`.
+
 ### Data Persistence Strategy
 - **Service Discovery**: Redis is currently used primarily for ZMQ Service Discovery (`core/src/zmq/discovery.rs`).
 - **State Storage**: Application state (positions, orders, balances) is currently kept in-memory within the Actor managers.
@@ -151,6 +162,7 @@ Risk parameters to make configurable:
 - Don't use custom error enums for simple retryable network errors
 - Don't use fullpath imports
 - Don't import inside functions, structs, or enums use `std::collections::HashSet` instead of `use std::collections::HashSet;`
+- Don't use bare `.json()` on `reqwest::Response` for order-critical endpoints — use `ResponseExt::json_logged()` or `check_and_parse()` so raw bodies are always logged on failure
 
 ### Testing Approach
 - Write unit tests for type conversions
@@ -173,11 +185,11 @@ When suggesting code, prioritize maintainability and extensibility over cleverne
 [diagram.md](./diagram.md)
 
 ## current module structure
-- `core/`: Shared abstractions, traits, types, managers (account, order, position, price), HTTP/WS utilities, and ZMQ protocol. **(SOLID BACKBONE - DO NOT BREAK)**
+- `core/`: Shared abstractions, traits, types, managers (account, order, position, price), HTTP/WS utilities (`ResponseExt`, `check_and_parse`), and ZMQ protocol. **(SOLID BACKBONE - DO NOT BREAK)**
 - `exchanges/`: Exchange-specific implementations (e.g., `binance/`). Must implement `core` traits.
-- `strategies/`: Trading strategies (e.g., `manual/`) and REPL.
+- `strategies/`: Trading strategies (e.g., `arbitrage/`, `manual/`) and REPL.
 - `src/`: Main entry points, CLI, wizard, and runner.
-- `config/`: Configuration files (`default.toml`, `local.toml`, `exchanges/`).
+- `config/`: Configuration files (`default.toml`, `local.toml`, `exchanges/`, `strategies/`).
 
 ## project goals
 1. Build a robust, modular architecture that supports multiple exchanges with minimal code duplication
