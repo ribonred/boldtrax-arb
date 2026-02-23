@@ -1,6 +1,7 @@
 mod manual;
 
 use anyhow::Result;
+use boldtrax_core::FundingRateSnapshot;
 use boldtrax_core::types::{
     Exchange, InstrumentKey, InstrumentType, OrderRequest, OrderSide, OrderType, Pairs,
 };
@@ -10,7 +11,9 @@ use manual::ManualStrategy;
 use rust_decimal::Decimal;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -32,6 +35,9 @@ async fn main() -> Result<()> {
 
     let mut strategy = ManualStrategy::new(&args.redis_url, args.exchange).await?;
     let mut event_rx = strategy.subscribe();
+    let fundingrate_store: Arc<RwLock<HashMap<InstrumentKey, FundingRateSnapshot>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let funding_clone = fundingrate_store.clone();
 
     // Spawn a background task to print events
     tokio::spawn(async move {
@@ -46,6 +52,11 @@ async fn main() -> Result<()> {
                 ZmqEvent::PositionUpdate(pos) => {
                     println!("\n[EVENT] Position Update: {:?}", pos);
                 }
+                ZmqEvent::FundingRate(snap) => {
+                    if let Ok(mut funding) = funding_clone.write() {
+                        funding.insert(snap.key, snap);
+                    }
+                }
                 _ => {} // Ignore other events for now to avoid spam
             }
         }
@@ -53,7 +64,6 @@ async fn main() -> Result<()> {
 
     let mut rl = DefaultEditor::new()?;
     println!("Connected to ExchangeRunner. Type 'help' for commands.");
-
     loop {
         let readline = rl.readline(">> ");
         match readline {
@@ -76,6 +86,25 @@ async fn main() -> Result<()> {
                         println!("  sell <pair> <type> <size> [price]");
                         println!("  cancel <order_id>");
                         println!("  exit");
+                    }
+                    "fundingrate" => {
+                        if parts.len() < 2 {
+                            println!("Usage: fundingrate <instrument_key>");
+                            continue;
+                        }
+                        let key = match InstrumentKey::from_str(parts[1]) {
+                            Ok(k) => k,
+                            Err(_) => {
+                                println!("Invalid instrument key");
+                                continue;
+                            }
+                        };
+                        if let Ok(funding) = fundingrate_store.read() {
+                            match funding.get(&key) {
+                                Some(rate) => println!("{:#?}", rate),
+                                None => println!("No funding rate data for this instrument"),
+                            }
+                        }
                     }
                     "balance" => match strategy.get_account_snapshot().await {
                         Ok(snapshot) => println!("{:#?}", snapshot),

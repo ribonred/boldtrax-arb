@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
                 exchange: Exchange::Binance,
                 execution_mode,
                 account_reconcile_interval: Duration::from_secs(30),
-                funding_rate_poll_interval: Duration::from_secs(10),
+                funding_rate_poll_interval: Duration::from_secs(60),
                 tracked_keys,
                 account_manager_config: AccountManagerConfig {
                     mailbox_capacity: 64,

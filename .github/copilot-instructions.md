@@ -5,6 +5,8 @@ I'm building a cryptocurrency funding rate arbitrage system in Rust. The system 
 
 ## Core Architecture Principles
 
+**CRITICAL**: The backbone pattern in `core` (traits, types, managers) is solid and must NOT be broken. All new features and exchanges must conform to the existing trait interfaces and type system.
+
 ### Code Organization
 - Use a modular library structure with `core/` for shared abstractions and `exchanges/` for exchange-specific implementations
 - Keep exchange logic isolated in separate modules under `exchanges/[exchange_name]/`
@@ -48,12 +50,9 @@ Every exchange implementation must:
 - Never block on metrics collection
 
 ### Data Persistence Strategy
-- Use Redis as the primary data store, no PostgreSQL
-- Structure Redis keys hierarchically: `{category}:{exchange}:{symbol}`
-- Use sorted sets for time-series data (funding rate history)
-- Use hashes for structured data (positions, balances)
-- Keep application state in memory, sync critical state to Redis
-- Treat exchanges as the source of truth, not local storage
+- **Service Discovery**: Redis is currently used primarily for ZMQ Service Discovery (`core/src/zmq/discovery.rs`).
+- **State Storage**: Application state (positions, orders, balances) is currently kept in-memory within the Actor managers.
+- **Future Persistence**: When implementing persistence, structure Redis keys hierarchically: `{category}:{exchange}:{symbol}`. Use sorted sets for time-series data (funding rate history) and hashes for structured data. Treat exchanges as the source of truth, not local storage.
 
 ### Mock Trading and Testing Architecture
 - Implement a `MockExchange` that mimics real exchange behavior without executing actual trades
@@ -92,130 +91,27 @@ Risk parameters to make configurable:
 - Liquidation distance safety margin
 
 ### Error Handling Philosophy
+- **Domain/Critical Errors**: Use explicit `thiserror` enums for core trading operations, risk management, state transitions, and configuration validation. Never swallow these; propagate to top-level.
+- **Transient/Network Errors**: Use `anyhow::Result` for HTTP failures, WebSocket disconnects, and retryable operations. Always use `.context()` when converting library errors.
+- **Panics**: Only panic on programming errors (e.g., mutex poisoning), never on runtime conditions.
+- **Logging**: Log critical errors at ERROR level, retryable at WARN, recoverable at INFO.
 
-**Use explicit error enums (`thiserror`) for:**
-- **Core trading operations** (placing orders, canceling orders, closing positions)
-- **Risk management decisions** (position validation, leverage checks, risk limit violations)
-- **Critical state transitions** (opening positions, rebalancing, emergency shutdowns)
-- **Configuration validation** (invalid parameters, missing required fields)
-- **Exchange API critical errors** (authentication failures, insufficient balance, position conflicts)
+### Concurrency & State Management
+- **Actor Model**: The `core/manager/*` module uses an Actor-based design (`AccountManagerActor`, `PositionManagerActor`, etc.). State is kept in standard `HashMap`s encapsulated *inside* these actors.
+- **Message Passing**: Access actor state asynchronously via `mpsc` commands and `oneshot` replies. Do NOT use shared mutable state (like `DashMap` or `RwLock`) to bypass the actor mailboxes.
+- **Async Runtime**: Use `tokio`. Spawn separate tasks for each exchange connector and actor.
+- **Event Streams**: Use `tokio::sync::broadcast` or `tokio::sync::mpsc` for streams of events (e.g., order updates, individual trades).
+- **Global Single Values**: Use `tokio::sync::watch` ONLY for single, infrequently changing global values (e.g., `ExecutionMode`, `IndexPrice`, system status).
 
-**Use `anyhow::Result` for:**
-- **Network/transport errors** (HTTP failures, WebSocket disconnections, timeouts)
-- **Retryable operations** (fetching market data, querying balances, transient API errors)
-- **Non-critical auxiliary operations** (metrics collection, logging, cache updates)
-- **Utility functions** that don't need specific error handling
+### Inter-Process Communication (ZMQ)
+- **Decentralized API**: Each exchange connector provides its own ZMQ API (Server: ROUTER/PUB) to expose necessary data.
+- **Clients**: Strategies, risk management, quant research, and data lake integrations act as separate processes/clients (DEALER/SUB) connecting to the exchange's ZMQ server.
+- **Protocol**: Communication uses the `ZmqCommand` and `ZmqEvent` protocol defined in `core/src/zmq/protocol.rs`.
+- **Extensibility**: The current ZMQ API is designed to be easily extended in the future to support new data requirements for risk management and quantitative analysis.
 
-**Error enum design pattern:**
-```rust
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum TradingError {
-    #[error("Insufficient balance: required {required}, available {available}")]
-    InsufficientBalance { required: Decimal, available: Decimal },
-    
-    #[error("Position size {requested} exceeds limit {limit} for {symbol}")]
-    PositionLimitExceeded { symbol: String, requested: Decimal, limit: Decimal },
-    
-    #[error("Order {order_id} not found on exchange {exchange}")]
-    OrderNotFound { exchange: String, order_id: String },
-    
-    #[error("Invalid execution mode: cannot execute live trade in paper mode")]
-    InvalidExecutionMode,
-}
-
-#[derive(Error, Debug)]
-pub enum RiskError {
-    #[error("Leverage {leverage} exceeds maximum {max_leverage} for {symbol}")]
-    LeverageExceeded { symbol: String, leverage: Decimal, max_leverage: Decimal },
-    
-    #[error("Delta {delta} exceeds rebalance threshold {threshold}")]
-    DeltaThresholdExceeded { delta: Decimal, threshold: Decimal },
-    
-    #[error("Daily drawdown {drawdown_pct}% exceeds limit {limit_pct}%")]
-    DrawdownLimitExceeded { drawdown_pct: Decimal, limit_pct: Decimal },
-    
-    #[error("Funding rate {rate} below minimum threshold {min_threshold}")]
-    FundingRateBelowThreshold { rate: Decimal, min_threshold: Decimal },
-}
-
-#[derive(Error, Debug)]
-pub enum ConfigError {
-    #[error("Missing required configuration: {field}")]
-    MissingField { field: String },
-    
-    #[error("Invalid value for {field}: {value} (expected {expected})")]
-    InvalidValue { field: String, value: String, expected: String },
-    
-    #[error("Configuration validation failed: {reason}")]
-    ValidationFailed { reason: String },
-}
-```
-
-**Error handling guidelines:**
-- **Critical errors**: Use explicit enums, never swallow, propagate to top-level for handling
-- **Retryable errors**: Use `anyhow`, implement retry logic, log attempts
-- **Don't panic**: Only panic on programming errors (e.g., mutex poisoning), never on runtime conditions
-- **Provide context**: Always use `.context()` when converting from library errors to `anyhow`
-- **Match exhaustively**: When handling custom error enums, handle each variant explicitly
-- **Log appropriately**: Critical errors at ERROR level, retryable at WARN, recoverable at INFO
-
-**Conversion pattern:**
-```rust
-// Converting library errors to anyhow with context
-async fn fetch_funding_rate(&self, symbol: &str) -> anyhow::Result<FundingRate> {
-    let response = self.client
-        .get(&url)
-        .send()
-        .await
-        .context("Failed to connect to exchange API")?;
-    
-    let data = response
-        .json::<ExchangeResponse>()
-        .await
-        .context("Failed to parse funding rate response")?;
-    
-    Ok(self.convert_funding_rate(data))
-}
-
-// Explicit error for critical operations
-async fn place_order(&self, order: OrderRequest) -> Result<Order, TradingError> {
-    let balance = self.get_balance(&order.asset).await
-        .map_err(|_| TradingError::InsufficientBalance { 
-            required: order.size, 
-            available: Decimal::ZERO 
-        })?;
-    
-    if balance < order.size {
-        return Err(TradingError::InsufficientBalance {
-            required: order.size,
-            available: balance,
-        });
-    }
-    
-    // Execute order...
-}
-```
-
-### Async and Concurrency
-- Use `tokio` as the async runtime
-- Spawn separate tasks for each exchange connector
-- Use channels for inter-component communication
-- Avoid shared mutable state; prefer message passing
-- Use `Arc` for sharing immutable data across tasks
-
-### Adding New Exchanges
-When I ask you to add a new exchange:
-1. Create a new module under `exchanges/[exchange_name]/`
-2. Implement all required traits (MarketData, Account, Trading)
-3. Create exchange-specific types in `types.rs` within that module
-4. Convert exchange responses to common core types before returning
-5. Integrate metrics collection in every API call
-6. Implement WebSocket handler if needed
-7. Define exchange-specific error types if the exchange has unique error conditions
-8. Add proper error handling with appropriate error types (explicit enums for critical paths, anyhow for retryable)
-9. Create a mock version for testing if the exchange has unique features
+### Orchestration & CLI
+- **ExchangeRunner**: The `ExchangeRunner` (in `src/runner.rs`) is the central orchestrator for a specific exchange. It wires up the actors, exchange clients, and the ZMQ server.
+- **CLI Tools**: The `src/cli/` module contains a `wizard` for generating configuration files (`local.toml`) and a `doctor` for health checks. New configuration parameters must be added to the wizard and validated by the doctor.
 
 ### Code Style Preferences
 - Prefer explicit over implicit
@@ -276,6 +172,12 @@ When suggesting code, prioritize maintainability and extensibility over cleverne
 ## current architectural diagram
 [diagram.md](./diagram.md)
 
+## current module structure
+- `core/`: Shared abstractions, traits, types, managers (account, order, position, price), HTTP/WS utilities, and ZMQ protocol. **(SOLID BACKBONE - DO NOT BREAK)**
+- `exchanges/`: Exchange-specific implementations (e.g., `binance/`). Must implement `core` traits.
+- `strategies/`: Trading strategies (e.g., `manual/`) and REPL.
+- `src/`: Main entry points, CLI, wizard, and runner.
+- `config/`: Configuration files (`default.toml`, `local.toml`, `exchanges/`).
 
 ## project goals
 1. Build a robust, modular architecture that supports multiple exchanges with minimal code duplication

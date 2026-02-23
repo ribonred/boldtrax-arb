@@ -95,7 +95,6 @@ enum PriceCommand {
     },
 }
 
-/// Internal result from a background REST fetch.
 struct RestFetchResult {
     key: InstrumentKey,
     result: Result<OrderBookSnapshot, PriceManagerError>,
@@ -129,10 +128,6 @@ where
     /// Keys that have an in-flight REST fetch.
     fetching: HashSet<InstrumentKey>,
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Handle
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Cheap-to-clone handle that external code uses to interact with the actor.
 #[derive(Clone)]
