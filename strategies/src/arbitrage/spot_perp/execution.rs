@@ -1,19 +1,20 @@
-use crate::arbitrage::decider::DeciderAction;
 use crate::arbitrage::policy::{ExecutionError, ExecutionPolicy};
-use crate::arbitrage::types::SpotPerpPair;
+use crate::arbitrage::spot_perp::types::SpotPerpPair;
+use crate::arbitrage::types::{DeciderAction, PairStatus};
 use async_trait::async_trait;
+use boldtrax_core::CoreApi;
 use boldtrax_core::types::{InstrumentKey, OrderRequest, OrderSide, OrderType};
-use boldtrax_core::zmq::client::ZmqCommandClient;
+use boldtrax_core::zmq::router::ZmqRouter;
 use rust_decimal::Decimal;
 use tracing::{debug, error, info, warn};
 
-pub struct ExecutionEngine {
-    pub client: ZmqCommandClient,
+pub struct SpotPerpExecutionEngine {
+    pub router: ZmqRouter,
 }
 
-impl ExecutionEngine {
-    pub fn new(client: ZmqCommandClient) -> Self {
-        Self { client }
+impl SpotPerpExecutionEngine {
+    pub fn new(router: ZmqRouter) -> Self {
+        Self { router }
     }
 
     pub async fn execute(&mut self, action: DeciderAction, pair: &mut SpotPerpPair) {
@@ -158,7 +159,7 @@ impl ExecutionEngine {
             "Submitting order"
         );
         let key = req.key;
-        match self.client.submit_order(req).await {
+        match self.router.submit_order(req).await {
             Ok(order) => {
                 info!("Order submitted: {:?}", order);
                 Ok(())
@@ -175,7 +176,7 @@ impl ExecutionEngine {
 }
 
 #[async_trait]
-impl ExecutionPolicy<SpotPerpPair> for ExecutionEngine {
+impl ExecutionPolicy<SpotPerpPair> for SpotPerpExecutionEngine {
     fn name(&self) -> &'static str {
         "zmq_execution_engine"
     }
@@ -246,7 +247,7 @@ impl ExecutionPolicy<SpotPerpPair> for ExecutionEngine {
                 .await?;
                 self.place_perp_order(&pair.perp.key.clone(), perp_size, true)
                     .await?;
-                pair.status = crate::arbitrage::types::PairStatus::Inactive;
+                pair.status = PairStatus::Inactive;
             }
             DeciderAction::DoNothing => {
                 debug!("No action required");

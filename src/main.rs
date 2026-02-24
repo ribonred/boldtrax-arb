@@ -5,11 +5,15 @@ mod strategy;
 
 use std::time::Duration;
 
+use std::str::FromStr;
+
 use boldtrax_core::config::types::AppConfig;
 use boldtrax_core::types::Exchange;
 use clap::{Parser, Subcommand, ValueEnum};
 use dotenvy::dotenv;
-use strategies::arbitrage::config::SpotPerpStrategyConfig;
+use strategies::arbitrage::perp_perp::config::PerpPerpStrategyConfig;
+use strategies::arbitrage::runner::StrategyKind;
+use strategies::arbitrage::spot_perp::config::SpotPerpStrategyConfig;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
@@ -188,13 +192,36 @@ async fn run_all(app_config: &AppConfig) -> anyhow::Result<()> {
     // 2. Wait for ZMQ services to register before launching strategy
     let mut strategy_handle = None;
     if let Some(runner_strategy) = &app_config.runner.strategies {
-        // Strategy config owns instrument keys; derive exchange from there
-        let strategy_config = SpotPerpStrategyConfig::from_strategy_map(&app_config.strategy);
-        let exchange = strategy_config.exchange();
+        // Derive exchange(s) from the strategy config to wait for ZMQ discovery.
+        let kind = StrategyKind::from_str(&runner_strategy.strategy).unwrap_or_else(|_| {
+            eprintln!(
+                "[FATAL] Unknown strategy '{}' in runner.strategies",
+                runner_strategy.strategy
+            );
+            std::process::exit(1);
+        });
+
+        let exchanges_to_wait: Vec<Exchange> = match kind {
+            StrategyKind::SpotPerp => {
+                let cfg = SpotPerpStrategyConfig::from_strategy_map(&app_config.strategy);
+                vec![cfg.exchange()]
+            }
+            StrategyKind::PerpPerp => {
+                let cfg = PerpPerpStrategyConfig::from_strategy_map(&app_config.strategy);
+                let mut exs = vec![cfg.exchange_long()];
+                if cfg.exchange_short() != cfg.exchange_long() {
+                    exs.push(cfg.exchange_short());
+                }
+                exs
+            }
+        };
 
         // Exchange runner needs time to: load instruments, spawn managers,
         // bind ZMQ sockets, and register in Redis. Give it a generous timeout.
-        strategy::poll_until_ready(&app_config.redis_url, exchange, Duration::from_secs(30)).await;
+        for exchange in &exchanges_to_wait {
+            strategy::poll_until_ready(&app_config.redis_url, *exchange, Duration::from_secs(30))
+                .await;
+        }
 
         match strategy::spawn_strategy_runner(app_config, &runner_strategy.strategy).await {
             Ok(handle) => {

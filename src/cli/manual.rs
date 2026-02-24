@@ -23,7 +23,7 @@ use tracing::info;
 pub async fn run_manual(app_config: &AppConfig, exchange: Exchange) -> Result<()> {
     info!("Starting Manual Strategy REPL for {:?}", exchange);
 
-    let mut strategy = ManualStrategy::new(&app_config.redis_url, exchange).await?;
+    let strategy = ManualStrategy::new(&app_config.redis_url, exchange).await?;
     let mut event_rx = strategy.subscribe();
     let fundingrate_store: Arc<RwLock<HashMap<InstrumentKey, FundingRateSnapshot>>> =
         Arc::new(RwLock::new(HashMap::new()));

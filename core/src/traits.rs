@@ -429,3 +429,33 @@ impl<T: PositionProvider + Send + Sync> PositionProvider for std::sync::Arc<T> {
         self.as_ref().stream_position_updates(tx).await
     }
 }
+use crate::types::{Exchange, Order, OrderRequest, Position};
+
+/// Unified API contract for exchange command routing.
+///
+/// Every method either auto-routes by [`InstrumentKey::exchange`] or
+/// takes an explicit [`Exchange`] argument.  Implementors include
+/// [`ZmqRouter`] (production) and potential mock/stub implementations
+/// for testing.
+#[async_trait]
+pub trait CoreApi: Send + Sync {
+    async fn submit_order(&self, req: OrderRequest) -> anyhow::Result<Order>;
+
+    async fn get_position(&self, key: InstrumentKey) -> anyhow::Result<Option<Position>>;
+
+    async fn get_instrument(&self, key: InstrumentKey) -> anyhow::Result<Option<Instrument>>;
+
+    async fn get_reference_price(&self, key: InstrumentKey) -> anyhow::Result<Decimal>;
+
+    async fn get_funding_rate(&self, key: InstrumentKey) -> anyhow::Result<FundingRateSnapshot>;
+
+    async fn set_leverage(&self, key: InstrumentKey, leverage: Decimal) -> anyhow::Result<Decimal>;
+
+    async fn cancel_order(&self, exchange: Exchange, id: String) -> anyhow::Result<Order>;
+
+    async fn get_all_positions(&self, exchange: Exchange) -> anyhow::Result<Vec<Position>>;
+
+    async fn get_account_snapshot(&self, exchange: Exchange) -> anyhow::Result<AccountSnapshot>;
+
+    async fn get_all_instruments(&self, exchange: Exchange) -> anyhow::Result<Vec<Instrument>>;
+}

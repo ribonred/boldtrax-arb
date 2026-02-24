@@ -1,11 +1,15 @@
 use crate::AccountSnapshot;
-use crate::types::{Exchange, Instrument, InstrumentKey, Order, OrderRequest, Position};
+use crate::traits::CoreApi;
+use crate::types::{
+    Exchange, FundingRateSnapshot, Instrument, InstrumentKey, Order, OrderRequest, Position,
+};
 use crate::zmq::discovery::{DiscoveryClient, ServiceType};
 use crate::zmq::protocol::{ZmqCommand, ZmqEvent, ZmqResponse};
 use anyhow::{Context, Result};
 use rkyv::{Deserialize, Infallible};
+use rust_decimal::Decimal;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
@@ -15,7 +19,7 @@ pub struct ZmqClient {
 }
 
 pub struct ZmqCommandClient {
-    dealer: DealerSocket,
+    dealer: Mutex<DealerSocket>,
 }
 
 pub struct ZmqEventSubscriber {
@@ -59,7 +63,7 @@ impl ZmqClient {
     pub fn split(self) -> (ZmqCommandClient, ZmqEventSubscriber) {
         (
             ZmqCommandClient {
-                dealer: self.dealer,
+                dealer: Mutex::new(self.dealer),
             },
             ZmqEventSubscriber { sub: self.sub },
         )
@@ -67,122 +71,21 @@ impl ZmqClient {
 }
 
 impl ZmqCommandClient {
-    pub async fn submit_order(&mut self, req: OrderRequest) -> Result<Order> {
-        let response = self.send_command(ZmqCommand::SubmitOrder(req)).await?;
-        match response {
-            ZmqResponse::SubmitAck(order) => Ok(order),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn cancel_order(&mut self, id: String) -> Result<Order> {
-        let response = self.send_command(ZmqCommand::CancelOrder(id)).await?;
-        match response {
-            ZmqResponse::CancelAck(order) => Ok(order),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn get_position(&mut self, key: InstrumentKey) -> Result<Option<Position>> {
-        let response = self.send_command(ZmqCommand::GetPosition(key)).await?;
-        match response {
-            ZmqResponse::Position(pos) => Ok(pos),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn get_all_positions(&mut self) -> Result<Vec<Position>> {
-        let response = self.send_command(ZmqCommand::GetAllPositions).await?;
-        match response {
-            ZmqResponse::AllPositions(positions) => Ok(positions),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn get_account_snapshot(&mut self) -> Result<AccountSnapshot> {
-        let response = self.send_command(ZmqCommand::GetAccountSnapshot).await?;
-        match response {
-            ZmqResponse::AccountSnapshot(snapshot) => Ok(snapshot),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn get_instrument(&mut self, key: InstrumentKey) -> Result<Option<Instrument>> {
-        let response = self.send_command(ZmqCommand::GetInstrument(key)).await?;
-        match response {
-            ZmqResponse::Instrument(instrument) => Ok(instrument),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn get_all_instruments(&mut self) -> Result<Vec<Instrument>> {
-        let response = self.send_command(ZmqCommand::GetAllInstruments).await?;
-        match response {
-            ZmqResponse::AllInstruments(instruments) => Ok(instruments),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn get_reference_price(
-        &mut self,
-        key: InstrumentKey,
-    ) -> Result<rust_decimal::Decimal> {
-        let response = self
-            .send_command(ZmqCommand::GetReferencePrice(key))
-            .await?;
-        match response {
-            ZmqResponse::ReferencePrice(price) => Ok(price),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn get_funding_rate(
-        &mut self,
-        key: InstrumentKey,
-    ) -> Result<crate::types::FundingRateSnapshot> {
-        let response = self.send_command(ZmqCommand::GetFundingRate(key)).await?;
-        match response {
-            ZmqResponse::FundingRate(snapshot) => Ok(snapshot),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    pub async fn set_leverage(
-        &mut self,
-        key: InstrumentKey,
-        leverage: rust_decimal::Decimal,
-    ) -> Result<rust_decimal::Decimal> {
-        let response = self
-            .send_command(ZmqCommand::SetLeverage(key, leverage))
-            .await?;
-        match response {
-            ZmqResponse::SetLeverageAck(actual) => Ok(actual),
-            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    async fn send_command(&mut self, command: ZmqCommand) -> Result<ZmqResponse> {
+    async fn send_command(&self, command: ZmqCommand) -> Result<ZmqResponse> {
         let payload = rkyv::to_bytes::<_, 1024>(&command).unwrap();
 
         let mut msg = ZmqMessage::from(bytes::Bytes::new()); // Empty frame for DEALER
         msg.push_back(payload.into_vec().into());
 
-        self.dealer.send(msg).await?;
+        let mut dealer = self.dealer.lock().await;
+        dealer.send(msg).await?;
 
         // Wait for response with timeout
-        let response_msg = tokio::time::timeout(Duration::from_secs(5), self.dealer.recv())
+        let response_msg = tokio::time::timeout(Duration::from_secs(5), dealer.recv())
             .await
             .context("Timeout waiting for ZMQ response")??;
+
+        drop(dealer); // Release lock before deserialization
 
         if response_msg.len() < 2 {
             anyhow::bail!("Received malformed DEALER message");
@@ -198,6 +101,103 @@ impl ZmqCommandClient {
 
         let response: ZmqResponse = archived.deserialize(&mut Infallible).unwrap();
         Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl CoreApi for ZmqCommandClient {
+    async fn submit_order(&self, req: OrderRequest) -> Result<Order> {
+        let response = self.send_command(ZmqCommand::SubmitOrder(req)).await?;
+        match response {
+            ZmqResponse::SubmitAck(order) => Ok(order),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn get_position(&self, key: InstrumentKey) -> Result<Option<Position>> {
+        let response = self.send_command(ZmqCommand::GetPosition(key)).await?;
+        match response {
+            ZmqResponse::Position(pos) => Ok(pos),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn get_instrument(&self, key: InstrumentKey) -> Result<Option<Instrument>> {
+        let response = self.send_command(ZmqCommand::GetInstrument(key)).await?;
+        match response {
+            ZmqResponse::Instrument(instrument) => Ok(instrument),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn get_reference_price(&self, key: InstrumentKey) -> Result<Decimal> {
+        let response = self
+            .send_command(ZmqCommand::GetReferencePrice(key))
+            .await?;
+        match response {
+            ZmqResponse::ReferencePrice(price) => Ok(price),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn get_funding_rate(&self, key: InstrumentKey) -> Result<FundingRateSnapshot> {
+        let response = self.send_command(ZmqCommand::GetFundingRate(key)).await?;
+        match response {
+            ZmqResponse::FundingRate(snapshot) => Ok(snapshot),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn set_leverage(&self, key: InstrumentKey, leverage: Decimal) -> Result<Decimal> {
+        let response = self
+            .send_command(ZmqCommand::SetLeverage(key, leverage))
+            .await?;
+        match response {
+            ZmqResponse::SetLeverageAck(actual) => Ok(actual),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn cancel_order(&self, _exchange: Exchange, id: String) -> Result<Order> {
+        let response = self.send_command(ZmqCommand::CancelOrder(id)).await?;
+        match response {
+            ZmqResponse::CancelAck(order) => Ok(order),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn get_all_positions(&self, _exchange: Exchange) -> Result<Vec<Position>> {
+        let response = self.send_command(ZmqCommand::GetAllPositions).await?;
+        match response {
+            ZmqResponse::AllPositions(positions) => Ok(positions),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn get_account_snapshot(&self, _exchange: Exchange) -> Result<AccountSnapshot> {
+        let response = self.send_command(ZmqCommand::GetAccountSnapshot).await?;
+        match response {
+            ZmqResponse::AccountSnapshot(snapshot) => Ok(snapshot),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn get_all_instruments(&self, _exchange: Exchange) -> Result<Vec<Instrument>> {
+        let response = self.send_command(ZmqCommand::GetAllInstruments).await?;
+        match response {
+            ZmqResponse::AllInstruments(instruments) => Ok(instruments),
+            ZmqResponse::Error(e) => anyhow::bail!("Exchange error: {}", e),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
     }
 }
 

@@ -1,21 +1,28 @@
 use async_trait::async_trait;
+use std::marker::PhantomData;
 
-use crate::arbitrage::decider::DeciderAction;
 use crate::arbitrage::policy::{ExecutionError, ExecutionPolicy};
-use crate::arbitrage::types::SpotPerpPair;
+use crate::arbitrage::types::{DeciderAction, PairState, PairStatus};
 
 /// Paper-trading decorator for any [`ExecutionPolicy`].
 ///
 /// Wraps a real execution engine and intercepts all orders, logging simulated
-/// fills without forwarding anything to the exchange. Swap in `PaperExecution<E>`
+/// fills without forwarding anything to the exchange. Swap in `PaperExecution<P, E>`
 /// at composition time to run any strategy in simulation without code changes.
-pub struct PaperExecution<E> {
+///
+/// Generic over the pair type `P` so the same decorator works for spot-perp,
+/// perp-perp, or any future pair strategy.
+pub struct PaperExecution<P, E> {
     inner: E,
+    _pair: PhantomData<P>,
 }
 
-impl<E> PaperExecution<E> {
+impl<P, E> PaperExecution<P, E> {
     pub fn new(inner: E) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            _pair: PhantomData,
+        }
     }
 
     /// Access to the underlying execution engine (e.g. for inspection in tests).
@@ -25,7 +32,11 @@ impl<E> PaperExecution<E> {
 }
 
 #[async_trait]
-impl<E: ExecutionPolicy<SpotPerpPair> + Send> ExecutionPolicy<SpotPerpPair> for PaperExecution<E> {
+impl<P, E> ExecutionPolicy<P> for PaperExecution<P, E>
+where
+    P: PairState,
+    E: ExecutionPolicy<P> + Send,
+{
     fn name(&self) -> &'static str {
         "paper_execution"
     }
@@ -33,8 +44,9 @@ impl<E: ExecutionPolicy<SpotPerpPair> + Send> ExecutionPolicy<SpotPerpPair> for 
     async fn execute_inner(
         &mut self,
         action: &DeciderAction,
-        pair: &mut SpotPerpPair,
+        pair: &mut P,
     ) -> Result<(), ExecutionError> {
+        let keys = pair.leg_keys();
         match action {
             DeciderAction::Enter {
                 size_long,
@@ -42,14 +54,13 @@ impl<E: ExecutionPolicy<SpotPerpPair> + Send> ExecutionPolicy<SpotPerpPair> for 
             } => {
                 tracing::info!(
                     mode = "paper",
-                    spot = ?pair.spot.key,
-                    perp = ?pair.perp.key,
+                    legs = ?keys,
                     size_long = %size_long,
                     size_short = %size_short,
                     monotonic_counter.paper_orders_simulated = 2,
                     "PAPER: simulated Enter fill"
                 );
-                pair.status = crate::arbitrage::types::PairStatus::Active;
+                pair.set_status(PairStatus::Active);
             }
             DeciderAction::Rebalance {
                 size_long,
@@ -57,24 +68,22 @@ impl<E: ExecutionPolicy<SpotPerpPair> + Send> ExecutionPolicy<SpotPerpPair> for 
             } => {
                 tracing::info!(
                     mode = "paper",
-                    spot = ?pair.spot.key,
-                    perp = ?pair.perp.key,
+                    legs = ?keys,
                     size_long = %size_long,
                     size_short = %size_short,
                     monotonic_counter.paper_orders_simulated = 2,
                     "PAPER: simulated Rebalance fill"
                 );
-                pair.status = crate::arbitrage::types::PairStatus::Active;
+                pair.set_status(PairStatus::Active);
             }
             DeciderAction::Exit => {
                 tracing::info!(
                     mode = "paper",
-                    spot = ?pair.spot.key,
-                    perp = ?pair.perp.key,
+                    legs = ?keys,
                     monotonic_counter.paper_orders_simulated = 2,
                     "PAPER: simulated Exit fill"
                 );
-                pair.status = crate::arbitrage::types::PairStatus::Inactive;
+                pair.set_status(PairStatus::Inactive);
             }
             DeciderAction::DoNothing => {}
         }

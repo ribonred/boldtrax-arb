@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::arbitrage::decider::{DeciderAction, SpotRebalanceDecider};
     use crate::arbitrage::policy::DecisionPolicy;
-    use crate::arbitrage::types::SpotPerpPair;
+    use crate::arbitrage::spot_perp::decider::SpotRebalanceDecider;
+    use crate::arbitrage::spot_perp::types::SpotPerpPair;
+    use crate::arbitrage::types::{DeciderAction, PairStatus};
     use boldtrax_core::types::{Exchange, InstrumentKey, InstrumentType, Pairs};
     use rust_decimal::Decimal;
     use std::str::FromStr;
@@ -51,7 +52,7 @@ mod tests {
         pair.perp.funding_rate = dec("-0.001");
 
         // Simulate an open position.
-        pair.status = crate::arbitrage::types::PairStatus::Active;
+        pair.status = PairStatus::Active;
         pair.spot.quantity = dec("1.0");
         pair.perp.position_size = dec("-1.0");
 
@@ -69,7 +70,7 @@ mod tests {
         pair.perp.funding_rate = dec("0.002");
 
         // Simulate an open position with a delta imbalance.
-        pair.status = crate::arbitrage::types::PairStatus::Active;
+        pair.status = PairStatus::Active;
         pair.spot.quantity = dec("1.0");
         pair.spot.current_price = dec("50000.0");
         pair.perp.position_size = dec("-0.9"); // Imbalance: spot notional 50000, perp notional -45000 → delta 5000

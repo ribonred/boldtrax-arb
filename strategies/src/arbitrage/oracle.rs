@@ -1,5 +1,6 @@
+use boldtrax_core::CoreApi;
 use boldtrax_core::types::{InstrumentKey, OrderBookSnapshot, Ticker};
-use boldtrax_core::zmq::client::ZmqCommandClient;
+use boldtrax_core::zmq::router::ZmqRouter;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use tracing::debug;
@@ -22,7 +23,7 @@ impl PriceOracle {
     /// Fetch the reference price via ZMQ if it's not available locally.
     pub async fn fetch_reference_price(
         &mut self,
-        client: &mut ZmqCommandClient,
+        router: &ZmqRouter,
         key: InstrumentKey,
     ) -> anyhow::Result<Decimal> {
         if let Some(mid) = self.get_mid_price_inner(&key) {
@@ -30,7 +31,7 @@ impl PriceOracle {
         }
 
         debug!(?key, "Fetching reference price via ZMQ");
-        let price = client.get_reference_price(key).await?;
+        let price = router.get_reference_price(key).await?;
         Ok(price)
     }
 }

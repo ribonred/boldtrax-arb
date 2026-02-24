@@ -1,26 +1,28 @@
 use boldtrax_core::zmq::client::ZmqEventSubscriber;
 use strum::{Display, EnumString};
 
-use crate::arbitrage::decider::SpotRebalanceDecider;
 use crate::arbitrage::engine::ArbitrageEngine;
-use crate::arbitrage::execution::ExecutionEngine;
 use crate::arbitrage::margin::MarginManager;
 use crate::arbitrage::oracle::PriceOracle;
 use crate::arbitrage::paper::PaperExecution;
-use crate::arbitrage::types::SpotPerpPair;
+use crate::arbitrage::perp_perp::poller::PerpPerpPoller;
+use crate::arbitrage::spot_perp::decider::SpotRebalanceDecider;
+use crate::arbitrage::spot_perp::execution::SpotPerpExecutionEngine;
+use crate::arbitrage::spot_perp::types::SpotPerpPair;
 
 /// Strategy variant names — matches the `strategy` field in `[runner.strategies]`.
 /// Used at startup to dispatch into the correct `StrategyRunner` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, Display)]
 pub enum StrategyKind {
     SpotPerp,
+    PerpPerp,
 }
 
 /// Live funding-spread arbitrage: spot leg vs perp leg, real execution.
 pub type SpotPerpEngine = ArbitrageEngine<
     SpotPerpPair,
     SpotRebalanceDecider,
-    ExecutionEngine,
+    SpotPerpExecutionEngine,
     MarginManager,
     PriceOracle,
 >;
@@ -29,14 +31,24 @@ pub type SpotPerpEngine = ArbitrageEngine<
 pub type SpotPerpPaperEngine = ArbitrageEngine<
     SpotPerpPair,
     SpotRebalanceDecider,
-    PaperExecution<ExecutionEngine>,
+    PaperExecution<SpotPerpPair, SpotPerpExecutionEngine>,
     MarginManager,
     PriceOracle,
 >;
+pub type PerpPerpLivePoller = PerpPerpPoller<MarginManager, PriceOracle>;
+
+// Note: PaperExecution wraps the ExecutionPolicy, not the poller itself.
+// For paper mode, we swap the execution engine inside the poller.
+// This is handled at construction time in strategy.rs.
 
 pub enum StrategyRunner {
     SpotPerp(SpotPerpEngine, ZmqEventSubscriber),
     SpotPerpPaper(SpotPerpPaperEngine, ZmqEventSubscriber),
+    PerpPerp(
+        Box<PerpPerpLivePoller>,
+        ZmqEventSubscriber,
+        ZmqEventSubscriber,
+    ),
 }
 
 impl StrategyRunner {
@@ -44,6 +56,9 @@ impl StrategyRunner {
         match self {
             StrategyRunner::SpotPerp(engine, sub) => engine.run(sub).await,
             StrategyRunner::SpotPerpPaper(engine, sub) => engine.run(sub).await,
+            StrategyRunner::PerpPerp(poller, long_sub, short_sub) => {
+                poller.run(long_sub, short_sub).await;
+            }
         }
     }
 }

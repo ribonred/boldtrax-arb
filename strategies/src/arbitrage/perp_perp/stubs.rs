@@ -1,12 +1,8 @@
-//! Reusable test stubs for strategy policy traits.
-//! Exposed under `#[cfg(test)]` in `mod.rs`; wire into integration tests via
-//! `crate::arbitrage::stubs`.
-
 use async_trait::async_trait;
 
-use crate::arbitrage::decider::DeciderAction;
+use crate::arbitrage::perp_perp::types::PerpPerpPair;
 use crate::arbitrage::policy::{ExecutionError, ExecutionPolicy};
-use crate::arbitrage::types::{PairStatus, SpotPerpPair};
+use crate::arbitrage::types::{DeciderAction, PairStatus};
 
 /// Zero-network execution stub for integration tests.
 ///
@@ -42,7 +38,7 @@ impl Default for StubExecution {
 }
 
 #[async_trait]
-impl ExecutionPolicy<SpotPerpPair> for StubExecution {
+impl ExecutionPolicy<PerpPerpPair> for StubExecution {
     fn name(&self) -> &'static str {
         "stub_execution"
     }
@@ -50,7 +46,7 @@ impl ExecutionPolicy<SpotPerpPair> for StubExecution {
     async fn execute_inner(
         &mut self,
         action: &DeciderAction,
-        pair: &mut SpotPerpPair,
+        pair: &mut PerpPerpPair,
     ) -> Result<(), ExecutionError> {
         match action {
             DeciderAction::Enter {

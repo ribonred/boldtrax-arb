@@ -4,8 +4,7 @@ use boldtrax_core::types::{InstrumentKey, OrderBookSnapshot, Position, Ticker};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use crate::arbitrage::decider::DeciderAction;
-use crate::arbitrage::types::PairState;
+use crate::arbitrage::types::{DeciderAction, PairState};
 
 // ---------------------------------------------------------------------------
 // Error types

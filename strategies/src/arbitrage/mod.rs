@@ -1,7 +1,4 @@
-pub mod config;
-pub mod decider;
 pub mod engine;
-pub mod execution;
 pub mod margin;
 pub mod oracle;
 pub mod paper;
@@ -9,8 +6,8 @@ pub mod policy;
 pub mod runner;
 pub mod types;
 
-#[cfg(test)]
-pub mod stubs;
+pub mod perp_perp;
+pub mod spot_perp;
 
 #[cfg(test)]
 mod tests;

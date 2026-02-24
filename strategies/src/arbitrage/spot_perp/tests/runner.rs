@@ -1,11 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use crate::arbitrage::decider::SpotRebalanceDecider;
     use crate::arbitrage::engine::ArbitrageEngine;
     use crate::arbitrage::margin::MarginManager;
     use crate::arbitrage::oracle::PriceOracle;
-    use crate::arbitrage::stubs::StubExecution;
-    use crate::arbitrage::types::{PairStatus, SpotPerpPair};
+    use crate::arbitrage::paper::PaperExecution;
+    use crate::arbitrage::spot_perp::decider::SpotRebalanceDecider;
+    use crate::arbitrage::spot_perp::stubs::StubExecution;
+    use crate::arbitrage::spot_perp::types::SpotPerpPair;
+    use crate::arbitrage::types::PairStatus;
     use boldtrax_core::types::{
         Exchange, FundingInterval, FundingRateSnapshot, InstrumentKey, InstrumentType, Pairs,
     };
@@ -180,8 +182,6 @@ mod tests {
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn test_paper_engine_enter_cycle() {
-        use crate::arbitrage::paper::PaperExecution;
-
         let pair = SpotPerpPair::new(spot_key(), perp_key());
         let decider = SpotRebalanceDecider::new(dec("0.001"), dec("100"), dec("1.0"), dec("10"));
         let margin = MarginManager::new(dec("0.9"), dec("5.0"));
@@ -189,7 +189,7 @@ mod tests {
         let engine: ArbitrageEngine<
             SpotPerpPair,
             SpotRebalanceDecider,
-            PaperExecution<StubExecution>,
+            PaperExecution<SpotPerpPair, StubExecution>,
             MarginManager,
             PriceOracle,
         > = ArbitrageEngine::new(pair, PriceOracle::new(), decider, margin, paper);

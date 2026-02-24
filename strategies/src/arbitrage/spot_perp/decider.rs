@@ -1,5 +1,6 @@
 use crate::arbitrage::policy::DecisionPolicy;
-use crate::arbitrage::types::{PairState, PairStatus, SpotPerpPair};
+use crate::arbitrage::spot_perp::types::SpotPerpPair;
+use crate::arbitrage::types::{DeciderAction, PairState, PairStatus};
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
@@ -11,20 +12,6 @@ pub struct SpotRebalanceDecider {
     /// Delta drift threshold as a percentage of `target_notional`.
     /// E.g. 10 = trigger rebalance when delta exceeds 10% of target.
     pub rebalance_drift_pct: Decimal,
-}
-
-#[derive(Debug, Clone)]
-pub enum DeciderAction {
-    DoNothing,
-    Enter {
-        size_long: Decimal,
-        size_short: Decimal,
-    },
-    Rebalance {
-        size_long: Decimal,
-        size_short: Decimal,
-    },
-    Exit,
 }
 
 impl SpotRebalanceDecider {

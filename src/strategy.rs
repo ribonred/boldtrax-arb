@@ -7,17 +7,23 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::Context;
+use boldtrax_core::CoreApi;
 use boldtrax_core::config::types::AppConfig;
 use boldtrax_core::types::{Exchange, ExecutionMode};
 use boldtrax_core::zmq::client::ZmqClient;
 use boldtrax_core::zmq::discovery::{DiscoveryClient, ServiceType};
-use strategies::arbitrage::config::SpotPerpStrategyConfig;
+use boldtrax_core::zmq::router::ZmqRouter;
 use strategies::arbitrage::engine::ArbitrageEngine;
-use strategies::arbitrage::execution::ExecutionEngine;
 use strategies::arbitrage::oracle::PriceOracle;
 use strategies::arbitrage::paper::PaperExecution;
+use strategies::arbitrage::perp_perp::config::PerpPerpStrategyConfig;
+use strategies::arbitrage::perp_perp::execution::PerpPerpExecutionEngine;
+use strategies::arbitrage::perp_perp::poller::PerpPerpPoller;
+use strategies::arbitrage::perp_perp::types::PerpPerpPair;
 use strategies::arbitrage::runner::{StrategyKind, StrategyRunner};
-use strategies::arbitrage::types::SpotPerpPair;
+use strategies::arbitrage::spot_perp::config::SpotPerpStrategyConfig;
+use strategies::arbitrage::spot_perp::execution::SpotPerpExecutionEngine;
+use strategies::arbitrage::spot_perp::types::SpotPerpPair;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -81,6 +87,7 @@ pub async fn spawn_strategy_runner(
 
     match kind {
         StrategyKind::SpotPerp => spawn_spot_perp(app_config).await,
+        StrategyKind::PerpPerp => spawn_perp_perp(app_config).await,
     }
 }
 
@@ -100,17 +107,16 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
         "Connecting to exchange ZMQ server"
     );
 
-    // Connect to the exchange's ZMQ server via Redis discovery
-    let zmq_client = ZmqClient::connect(&app_config.redis_url, exchange)
+    // Build router with a single exchange
+    let router = ZmqRouter::connect_all(&app_config.redis_url, &[exchange])
         .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ZMQ server for exchange '{}'",
-                exchange
-            )
-        })?;
+        .with_context(|| format!("Failed to connect ZMQ router for '{}'", exchange))?;
 
-    let (mut command_client, event_subscriber) = zmq_client.split();
+    // Separate SUB connection for event stream
+    let zmq_sub = ZmqClient::connect(&app_config.redis_url, exchange)
+        .await
+        .with_context(|| format!("Failed to connect ZMQ subscriber for '{}'", exchange))?;
+    let (_cmd, event_subscriber) = zmq_sub.split();
 
     // Set leverage on the perp instrument before trading starts.
     let target_leverage = app_config.risk.max_leverage;
@@ -120,7 +126,7 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
         target_leverage = %target_leverage,
         "Setting leverage on exchange"
     );
-    let actual_leverage = command_client
+    let actual_leverage = router
         .set_leverage(perp_key, target_leverage)
         .await
         .with_context(|| {
@@ -140,7 +146,7 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
         instrument = %perp_key,
         "Fetching initial funding rate"
     );
-    let funding_snapshot = command_client
+    let funding_snapshot = router
         .get_funding_rate(perp_key)
         .await
         .with_context(|| format!("Failed to get funding rate for '{}'", perp_key))?;
@@ -166,7 +172,7 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
 
     let handle = match execution_mode {
         ExecutionMode::Paper => {
-            let execution = PaperExecution::new(ExecutionEngine::new(command_client));
+            let execution = PaperExecution::new(SpotPerpExecutionEngine::new(router));
             let engine = ArbitrageEngine::new(pair, oracle, decider, margin, execution);
             let runner = StrategyRunner::SpotPerpPaper(engine, event_subscriber);
             info!(
@@ -177,7 +183,7 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
             tokio::spawn(async move { runner.run().await })
         }
         ExecutionMode::Live => {
-            let execution = ExecutionEngine::new(command_client);
+            let execution = SpotPerpExecutionEngine::new(router);
             let engine = ArbitrageEngine::new(pair, oracle, decider, margin, execution);
             let runner = StrategyRunner::SpotPerp(engine, event_subscriber);
             info!(
@@ -188,6 +194,144 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
             tokio::spawn(async move { runner.run().await })
         }
     };
+
+    Ok(handle)
+}
+
+async fn spawn_perp_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()>> {
+    let strategy_config = PerpPerpStrategyConfig::from_strategy_map(&app_config.strategy);
+
+    let exchange_long = strategy_config.exchange_long();
+    let exchange_short = strategy_config.exchange_short();
+    let long_key = strategy_config.long_key();
+    let short_key = strategy_config.short_key();
+
+    info!(
+        strategy = "PerpPerp",
+        exchange_long = %exchange_long,
+        exchange_short = %exchange_short,
+        long = %long_key,
+        short = %short_key,
+        carry = ?strategy_config.carry_direction,
+        "Connecting to exchange ZMQ servers"
+    );
+
+    // Build router — deduplicates automatically if both legs are on the same exchange.
+    let router = ZmqRouter::connect_all(&app_config.redis_url, &[exchange_long, exchange_short])
+        .await
+        .with_context(|| "Failed to connect ZMQ router for PerpPerp exchanges")?;
+
+    // Separate SUB connections for event streams (one per exchange).
+    let zmq_sub_long = ZmqClient::connect(&app_config.redis_url, exchange_long)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect ZMQ subscriber for long exchange '{}'",
+                exchange_long
+            )
+        })?;
+    let (_cmd_long, sub_long) = zmq_sub_long.split();
+
+    let zmq_sub_short = ZmqClient::connect(&app_config.redis_url, exchange_short)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect ZMQ subscriber for short exchange '{}'",
+                exchange_short
+            )
+        })?;
+    let (_cmd_short, sub_short) = zmq_sub_short.split();
+
+    // Set leverage on both legs
+    let target_leverage = app_config.risk.max_leverage;
+
+    let actual_long = router
+        .set_leverage(long_key, target_leverage)
+        .await
+        .with_context(|| format!("Failed to set leverage for long '{}'", long_key))?;
+    info!(
+        strategy = "PerpPerp",
+        instrument = %long_key,
+        actual_leverage = %actual_long,
+        "Long leg leverage set"
+    );
+
+    let actual_short = router
+        .set_leverage(short_key, target_leverage)
+        .await
+        .with_context(|| format!("Failed to set leverage for short '{}'", short_key))?;
+    info!(
+        strategy = "PerpPerp",
+        instrument = %short_key,
+        actual_leverage = %actual_short,
+        "Short leg leverage set"
+    );
+
+    // Seed initial funding rates from both exchanges
+    let snap_long = router
+        .get_funding_rate(long_key)
+        .await
+        .with_context(|| format!("Failed to get funding rate for long '{}'", long_key))?;
+    info!(
+        strategy = "PerpPerp",
+        instrument = %long_key,
+        funding_rate = %snap_long.funding_rate,
+        mark_price = %snap_long.mark_price,
+        "Long funding seeded"
+    );
+
+    let snap_short = router
+        .get_funding_rate(short_key)
+        .await
+        .with_context(|| format!("Failed to get funding rate for short '{}'", short_key))?;
+    info!(
+        strategy = "PerpPerp",
+        instrument = %short_key,
+        funding_rate = %snap_short.funding_rate,
+        mark_price = %snap_short.mark_price,
+        "Short funding seeded"
+    );
+
+    // Build pair state
+    let mut pair = PerpPerpPair::new(
+        long_key,
+        short_key,
+        strategy_config.carry_direction,
+        strategy_config.cache_staleness(),
+    );
+    pair.target_notional = strategy_config.target_notional;
+    pair.long_leg.funding_rate = snap_long.funding_rate;
+    pair.long_leg.current_price = snap_long.mark_price;
+    pair.short_leg.funding_rate = snap_short.funding_rate;
+    pair.short_leg.current_price = snap_short.mark_price;
+    pair.funding_cache.update(long_key, snap_long);
+    pair.funding_cache.update(short_key, snap_short);
+
+    // Build policies
+    let oracle = PriceOracle::new();
+    let decider = strategy_config.build_decider();
+    let margin = strategy_config.build_margin(app_config.risk.max_leverage);
+
+    let execution = PerpPerpExecutionEngine::new(router.clone());
+
+    let poller = PerpPerpPoller {
+        pair,
+        decider,
+        execution,
+        margin,
+        oracle,
+        router,
+        poll_interval: strategy_config.poll_interval(),
+    };
+
+    let runner = StrategyRunner::PerpPerp(Box::new(poller), sub_long, sub_short);
+    info!(
+        strategy = "PerpPerp",
+        mode = ?app_config.execution_mode,
+        poll_interval_secs = strategy_config.poll_interval_secs,
+        "Strategy runner spawned"
+    );
+    let handle = tokio::spawn(async move { runner.run().await });
 
     Ok(handle)
 }

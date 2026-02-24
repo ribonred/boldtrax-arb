@@ -4,8 +4,8 @@ use boldtrax_core::types::{Exchange, InstrumentKey};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::arbitrage::decider::SpotRebalanceDecider;
 use crate::arbitrage::margin::MarginManager;
+use crate::arbitrage::spot_perp::decider::SpotRebalanceDecider;
 
 /// Deserialized from `[strategy.spot_perp]` in the TOML config stack.
 /// All fields are mandatory — the strategy panics at startup if any are
