@@ -120,6 +120,25 @@ Risk parameters to make configurable:
 - **Protocol**: Communication uses the `ZmqCommand` and `ZmqEvent` protocol defined in `core/src/zmq/protocol.rs`.
 - **Extensibility**: The current ZMQ API is designed to be easily extended in the future to support new data requirements for risk management and quantitative analysis.
 
+### CoreApi Trait & ZmqRouter
+- **`CoreApi`** (`core/src/traits.rs`) is the single unified contract for all exchange command routing. Both `ZmqCommandClient` and `ZmqRouter` implement it — the compiler enforces that they never drift apart.
+- **CoreApi methods (routed by `InstrumentKey`)**: `submit_order`, `get_position`, `get_instrument`, `get_reference_price`, `get_funding_rate`, `set_leverage`.
+- **CoreApi methods (explicit `Exchange`)**: `cancel_order`, `get_all_positions`, `get_account_snapshot`, `get_all_instruments`.
+- **`ZmqCommandClient`** wraps its DEALER socket in an internal `tokio::sync::Mutex` so all trait methods take `&self`. Each client is bound to a single exchange.
+- **`ZmqRouter`** (`core/src/zmq/router.rs`) is `Arc<HashMap<Exchange, ZmqCommandClient>>` — cheap to clone, process-wide shareable. Resolves `InstrumentKey.exchange` → client automatically and delegates to the client's `CoreApi` impl.
+- **`ZmqRouter::connect_all(redis_url, &[Exchange])`** creates one DEALER per unique exchange (deduplicates). SUB sockets are NOT managed — use `ZmqClient::connect` separately for event subscriptions.
+- **Adding a new method**: Add it to `CoreApi`, then the compiler forces both `ZmqCommandClient` and `ZmqRouter` to implement it.
+- All strategy code depends on `CoreApi` (import `boldtrax_core::CoreApi`), never on `ZmqCommandClient` directly.
+
+### Strategy Architecture
+- **Generic arbitrage layer** (`strategies/src/arbitrage/`): Shared traits (`ExecutionPolicy`, `DecisionPolicy`, `MarginPolicy`, `PriceSource`), `ArbitrageEngine`, `PriceOracle`, `MarginManager`, `PaperExecution`, `StrategyRunner`.
+- **SpotPerp** (`arbitrage/spot_perp/`): Event-driven via `ArbitrageEngine::run()`. Single exchange. Types: `SpotPerpPair`, `SpotRebalanceDecider`, `SpotPerpExecutionEngine`.
+- **PerpPerp** (`arbitrage/perp_perp/`): Poll-based via `PerpPerpPoller`. Cross-exchange from day one. Types: `PerpPerpPair`, `PerpPerpDecider`, `PerpPerpExecutionEngine`, `FundingCache`.
+- **ManualStrategy** (`strategies/src/manual/`): REPL-driven. Wraps `ZmqRouter` + SUB for interactive order management.
+- **Wiring** (`src/strategy.rs`): Reads strategy config, creates `ZmqRouter` + SUB sockets, seeds initial state, and spawns `StrategyRunner` variants.
+- **Order types**: Limit + post_only for entry/rebalance, Market + reduce_only for exit.
+- **Execution modes**: `Live` (real execution engine) and `Paper` (`PaperExecution` wrapper). Configured via `execution_mode` in config.
+
 ### Orchestration & CLI
 - **ExchangeRunner**: The `ExchangeRunner` (in `src/runner.rs`) is the central orchestrator for a specific exchange. It wires up the actors, exchange clients, and the ZMQ server.
 - **CLI Tools**: The `src/cli/` module contains a `wizard` for generating configuration files (`local.toml`) and a `doctor` for health checks. New configuration parameters must be added to the wizard and validated by the doctor.
@@ -182,13 +201,28 @@ Error handling must be explicit and type-safe for critical operations (trading, 
 When suggesting code, prioritize maintainability and extensibility over cleverness. The goal is a system that's easy to understand and modify as requirements evolve.
 
 ## current architectural diagram
-[diagram.md](./diagram.md)
+[diagram.md](./diagram.md) — split into two diagrams:
+1. **Exchange Runner (Server Side)** — actors, connectors, ZMQ server
+2. **Strategy Client (CoreApi / ZmqRouter)** — router, strategies, arbitrage layer
 
 ## current module structure
-- `core/`: Shared abstractions, traits, types, managers (account, order, position, price), HTTP/WS utilities (`ResponseExt`, `check_and_parse`), and ZMQ protocol. **(SOLID BACKBONE - DO NOT BREAK)**
+- `core/`: Shared abstractions, traits, types, managers (account, order, position, price), HTTP/WS utilities (`ResponseExt`, `check_and_parse`), ZMQ protocol, `CoreApi` trait, and `ZmqRouter`. **(SOLID BACKBONE - DO NOT BREAK)**
+  - `core/src/traits.rs`: `MarketData`, `Account`, `Trading`, `Exchange`, `CoreApi`, error enums
+  - `core/src/types.rs`: `InstrumentKey`, `Order`, `OrderRequest`, `Position`, `FundingRateSnapshot`, `Exchange` enum, etc.
+  - `core/src/manager/`: Actor-based managers (account, order, position, price)
+  - `core/src/zmq/`: `ZmqCommandClient` (impl `CoreApi`), `ZmqRouter` (impl `CoreApi`), `ZmqEventSubscriber`, `ZmqServer`, protocol, discovery
+  - `core/src/http/`: `TracedHttpClient`, `ResponseExt`, auth middleware
+  - `core/src/ws/`: WebSocket supervisor, reconnection policy
 - `exchanges/`: Exchange-specific implementations (e.g., `binance/`). Must implement `core` traits.
-- `strategies/`: Trading strategies (e.g., `arbitrage/`, `manual/`) and REPL.
-- `src/`: Main entry points, CLI, wizard, and runner.
+- `strategies/`: Trading strategies and shared arbitrage framework.
+  - `strategies/src/arbitrage/`: Generic layer — `ArbitrageEngine`, `PriceOracle`, `MarginManager`, `PaperExecution`, `StrategyRunner`, policy traits
+  - `strategies/src/arbitrage/spot_perp/`: SpotPerp strategy — event-driven, single exchange
+  - `strategies/src/arbitrage/perp_perp/`: PerpPerp strategy — poll-based, cross-exchange
+  - `strategies/src/manual/`: REPL-driven manual trading
+- `src/`: Main entry points, CLI, wizard, runner, strategy launcher.
+  - `src/runner.rs`: `ExchangeRunner` — wires actors, exchange clients, ZMQ server
+  - `src/strategy.rs`: Strategy launcher — creates `ZmqRouter`, seeds state, spawns `StrategyRunner`
+  - `src/cli/`: `wizard` (config generator), `doctor` (health checks), `manual` (REPL)
 - `config/`: Configuration files (`default.toml`, `local.toml`, `exchanges/`, `strategies/`).
 
 ## project goals
