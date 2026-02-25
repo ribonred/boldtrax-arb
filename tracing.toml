@@ -47,7 +47,7 @@ lossy          = true         # okay — file has the authoritative copy
 level = "info"
 directives = [
     # ── Application crates ────────────────────────────────────────────────────
-    "boldtrax_core=debug",
+    "boldtrax_core=info",
     "exchanges=debug",
     "strategies=debug",
     "boldtrax_bot=debug",

@@ -442,10 +442,6 @@ impl FundingRateMarketData for BybitClient {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────
-// OrderBookFeeder
-// ──────────────────────────────────────────────────────────────────
-
 #[async_trait]
 impl OrderBookFeeder for BybitClient {
     async fn fetch_order_book(&self, key: InstrumentKey) -> Result<OrderBookSnapshot, PriceError> {
@@ -516,11 +512,9 @@ impl OrderBookFeeder for BybitClient {
             cancel_on_close.cancel();
         });
 
-        // Build symbol -> key map (uppercase symbols)
         let mut map = HashMap::new();
         for k in &futures_keys {
             if let Some(instrument) = self.registry.get(k) {
-                // Bybit WS topic uses uppercase symbol: orderbook.1.BTCUSDT
                 map.insert(instrument.exchange_symbol.clone(), **k);
             }
         }
@@ -535,7 +529,8 @@ impl OrderBookFeeder for BybitClient {
             url: ws_url.to_string(),
             symbol_map: map,
             tx,
-            depth: 1,
+            depth: 50,
+            books: HashMap::new(),
         };
 
         let handle = ws_supervisor_spawn(policy, cancel);

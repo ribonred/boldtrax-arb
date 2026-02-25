@@ -100,9 +100,21 @@ where
             .refresh_prices(&|key| self.oracle.get_mid_price(key));
 
         // --- Refresh orderbook bid/ask for smart execution ---
+        // Use level 2 (3rd level) with fallback to level 1, then level 0.
+        // This places maker orders 2-3 levels deep for better fill probability.
         self.pair.refresh_orderbook(
-            &|key| self.oracle.get_best_bid(key),
-            &|key| self.oracle.get_best_ask(key),
+            &|key| {
+                self.oracle
+                    .get_bid_at_level(key, 2)
+                    .or_else(|| self.oracle.get_bid_at_level(key, 1))
+                    .or_else(|| self.oracle.get_best_bid(key))
+            },
+            &|key| {
+                self.oracle
+                    .get_ask_at_level(key, 2)
+                    .or_else(|| self.oracle.get_ask_at_level(key, 1))
+                    .or_else(|| self.oracle.get_best_ask(key))
+            },
             &|key| self.oracle.get_ask_depth(key),
             &|key| self.oracle.get_bid_depth(key),
         );

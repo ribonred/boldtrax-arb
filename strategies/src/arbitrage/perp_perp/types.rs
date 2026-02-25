@@ -239,8 +239,23 @@ impl PairState for PerpPerpPair {
         }
     }
 
-    // No orderbook-aware execution needed — both legs use Market orders.
-    // Default no-op from PairState trait is sufficient.
+    fn refresh_orderbook(
+        &mut self,
+        best_bid: &dyn Fn(&InstrumentKey) -> Option<Decimal>,
+        best_ask: &dyn Fn(&InstrumentKey) -> Option<Decimal>,
+        ask_depth: &dyn Fn(&InstrumentKey) -> Option<Decimal>,
+        bid_depth: &dyn Fn(&InstrumentKey) -> Option<Decimal>,
+    ) {
+        self.long_leg.best_bid = best_bid(&self.long_leg.key);
+        self.long_leg.best_ask = best_ask(&self.long_leg.key);
+        self.long_leg.ask_depth = ask_depth(&self.long_leg.key);
+        self.long_leg.bid_depth = bid_depth(&self.long_leg.key);
+
+        self.short_leg.best_bid = best_bid(&self.short_leg.key);
+        self.short_leg.best_ask = best_ask(&self.short_leg.key);
+        self.short_leg.ask_depth = ask_depth(&self.short_leg.key);
+        self.short_leg.bid_depth = bid_depth(&self.short_leg.key);
+    }
 
     fn positions_for_margin_check(&self) -> Vec<(&Position, Decimal)> {
         let mut checks = Vec::new();

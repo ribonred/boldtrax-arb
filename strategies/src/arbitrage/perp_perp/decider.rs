@@ -55,13 +55,65 @@ impl PerpPerpDecider {
 
         match pair.status {
             PairStatus::Inactive => {
-                // Guard: orphaned positions from a failed prior entry.
-                if !pair.long_leg.position_size.is_zero() || !pair.short_leg.position_size.is_zero()
-                {
+                let long_has_pos = !pair.long_leg.position_size.is_zero();
+                let short_has_pos = !pair.short_leg.position_size.is_zero();
+
+                // Recovery: one leg filled but the other failed.
+                // Emit Enter with size=0 for the filled leg so execution
+                // retries only the missing side (place_perp_order no-ops on zero).
+                if long_has_pos != short_has_pos {
+                    let long_price = pair.long_leg.current_price;
+                    let short_price = pair.short_leg.current_price;
+
+                    if (!long_has_pos && long_price.is_zero())
+                        || (!short_has_pos && short_price.is_zero())
+                    {
+                        warn!(
+                            long_has_pos,
+                            short_has_pos,
+                            long_price = %long_price,
+                            short_price = %short_price,
+                            "One-legged position but missing leg price not available yet"
+                        );
+                        return DeciderAction::DoNothing;
+                    }
+
+                    let size_long = if long_has_pos {
+                        Decimal::ZERO
+                    } else {
+                        // Match the short leg's notional
+                        let target = pair.short_leg.position_size.abs() * short_price;
+                        target / long_price
+                    };
+                    let size_short = if short_has_pos {
+                        Decimal::ZERO
+                    } else {
+                        // Match the long leg's notional
+                        let target = pair.long_leg.position_size.abs() * long_price;
+                        -(target / short_price)
+                    };
+
                     warn!(
                         long_size = %pair.long_leg.position_size,
                         short_size = %pair.short_leg.position_size,
-                        "Inactive but legs have positions, waiting for status transition"
+                        recovery_long = %size_long,
+                        recovery_short = %size_short,
+                        "One-legged position detected — retrying missing leg"
+                    );
+
+                    return DeciderAction::Enter {
+                        size_long,
+                        size_short,
+                    };
+                }
+
+                // Both legs have positions (sync issue) — wait for
+                // maybe_transition_to_active to promote to Active.
+                if long_has_pos && short_has_pos {
+                    debug!(
+                        long_size = %pair.long_leg.position_size,
+                        short_size = %pair.short_leg.position_size,
+                        "Both legs have positions, waiting for Active transition"
                     );
                     return DeciderAction::DoNothing;
                 }

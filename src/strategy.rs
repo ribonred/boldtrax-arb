@@ -25,7 +25,50 @@ use strategies::arbitrage::spot_perp::config::SpotPerpStrategyConfig;
 use strategies::arbitrage::spot_perp::execution::SpotPerpExecutionEngine;
 use strategies::arbitrage::spot_perp::types::SpotPerpPair;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+const MAX_CONNECT_RETRIES: u32 = 5;
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Retry an async connection operation with exponential backoff.
+///
+/// Retries up to `MAX_CONNECT_RETRIES` times, doubling the delay each
+/// attempt (2s → 4s → 8s → 16s → 32s). Returns the last error if all
+/// retries are exhausted.
+async fn retry_connect<T, F, Fut>(label: &str, mut f: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut delay = INITIAL_RETRY_DELAY;
+    for attempt in 1..=MAX_CONNECT_RETRIES {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if attempt == MAX_CONNECT_RETRIES {
+                    error!(
+                        label,
+                        attempt,
+                        error = %e,
+                        "Connection failed — retries exhausted"
+                    );
+                    return Err(e);
+                }
+                warn!(
+                    label,
+                    attempt,
+                    max_retries = MAX_CONNECT_RETRIES,
+                    retry_in_secs = delay.as_secs(),
+                    error = %e,
+                    "Connection failed — retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+    unreachable!()
+}
 
 /// Wait until the exchange's ZMQ services are registered in Redis.
 ///
@@ -107,15 +150,29 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
         "Connecting to exchange ZMQ server"
     );
 
-    // Build router with a single exchange
-    let router = ZmqRouter::connect_all(&app_config.redis_url, &[exchange])
-        .await
-        .with_context(|| format!("Failed to connect ZMQ router for '{}'", exchange))?;
+    // Build router with a single exchange (retries on failure)
+    let redis_url = app_config.redis_url.clone();
+    let router = retry_connect("ZmqRouter(SpotPerp)", || {
+        let url = redis_url.clone();
+        async move {
+            ZmqRouter::connect_all(&url, &[exchange])
+                .await
+                .with_context(|| format!("Failed to connect ZMQ router for '{}'", exchange))
+        }
+    })
+    .await?;
 
-    // Separate SUB connection for event stream
-    let zmq_sub = ZmqClient::connect(&app_config.redis_url, exchange)
-        .await
-        .with_context(|| format!("Failed to connect ZMQ subscriber for '{}'", exchange))?;
+    // Separate SUB connection for event stream (retries on failure)
+    let redis_url = app_config.redis_url.clone();
+    let zmq_sub = retry_connect("ZmqSubscriber(SpotPerp)", || {
+        let url = redis_url.clone();
+        async move {
+            ZmqClient::connect(&url, exchange)
+                .await
+                .with_context(|| format!("Failed to connect ZMQ subscriber for '{}'", exchange))
+        }
+    })
+    .await?;
     let (_cmd, event_subscriber) = zmq_sub.split();
 
     // Set leverage on the perp instrument before trading starts.
@@ -217,29 +274,49 @@ async fn spawn_perp_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
     );
 
     // Build router — deduplicates automatically if both legs are on the same exchange.
-    let router = ZmqRouter::connect_all(&app_config.redis_url, &[exchange_long, exchange_short])
-        .await
-        .with_context(|| "Failed to connect ZMQ router for PerpPerp exchanges")?;
+    // Retries with exponential backoff until both exchanges are reachable.
+    let redis_url = app_config.redis_url.clone();
+    let router = retry_connect("ZmqRouter(PerpPerp)", || {
+        let url = redis_url.clone();
+        async move {
+            ZmqRouter::connect_all(&url, &[exchange_long, exchange_short])
+                .await
+                .with_context(|| "Failed to connect ZMQ router for PerpPerp exchanges")
+        }
+    })
+    .await?;
 
-    // Separate SUB connections for event streams (one per exchange).
-    let zmq_sub_long = ZmqClient::connect(&app_config.redis_url, exchange_long)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect ZMQ subscriber for long exchange '{}'",
-                exchange_long
-            )
-        })?;
+    let redis_url = app_config.redis_url.clone();
+    let sub_long_fut = retry_connect("ZmqSub(long)", || {
+        let url = redis_url.clone();
+        async move {
+            ZmqClient::connect(&url, exchange_long)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to connect ZMQ subscriber for long exchange '{}'",
+                        exchange_long
+                    )
+                })
+        }
+    });
+    let redis_url = app_config.redis_url.clone();
+    let sub_short_fut = retry_connect("ZmqSub(short)", || {
+        let url = redis_url.clone();
+        async move {
+            ZmqClient::connect(&url, exchange_short)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to connect ZMQ subscriber for short exchange '{}'",
+                        exchange_short
+                    )
+                })
+        }
+    });
+
+    let (zmq_sub_long, zmq_sub_short) = tokio::try_join!(sub_long_fut, sub_short_fut)?;
     let (_cmd_long, sub_long) = zmq_sub_long.split();
-
-    let zmq_sub_short = ZmqClient::connect(&app_config.redis_url, exchange_short)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect ZMQ subscriber for short exchange '{}'",
-                exchange_short
-            )
-        })?;
     let (_cmd_short, sub_short) = zmq_sub_short.split();
 
     // Set leverage on both legs

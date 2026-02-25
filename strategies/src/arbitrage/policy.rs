@@ -195,6 +195,16 @@ pub trait PriceSource: Send + Sync {
     fn get_bid_depth(&self, _key: &InstrumentKey) -> Option<Decimal> {
         None
     }
+
+    /// Price at the Nth bid level (0-indexed: 0 = best bid, 1 = 2nd level, etc.).
+    fn get_bid_at_level(&self, _key: &InstrumentKey, _level: usize) -> Option<Decimal> {
+        None
+    }
+
+    /// Price at the Nth ask level (0-indexed: 0 = best ask, 1 = 2nd level, etc.).
+    fn get_ask_at_level(&self, _key: &InstrumentKey, _level: usize) -> Option<Decimal> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

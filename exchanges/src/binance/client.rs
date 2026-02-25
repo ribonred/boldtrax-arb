@@ -609,9 +609,13 @@ impl OrderExecutionProvider for BinanceClient {
             OrderSide::Buy => "BUY",
             OrderSide::Sell => "SELL",
         };
-        // LIMIT_MAKER is Binance's post-only order type.
+        // Post-only handling differs between Spot and Futures:
+        // - Spot: use LIMIT_MAKER (no timeInForce needed)
+        // - Futures: use LIMIT + GTX (Post-Only / maker-or-cancel)
+        let is_futures = request.key.instrument_type == InstrumentType::Swap;
         let (order_type, time_in_force) = match request.order_type {
             OrderType::Market => ("MARKET", None),
+            OrderType::Limit if request.post_only && is_futures => ("LIMIT", Some("GTX")),
             OrderType::Limit if request.post_only => ("LIMIT_MAKER", None),
             OrderType::Limit => ("LIMIT", Some("GTC")),
         };

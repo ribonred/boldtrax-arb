@@ -99,8 +99,11 @@ impl ExecutionPolicy<PerpPerpPair> for PerpPerpExecutionEngine {
                 size_long,
                 size_short,
             } => {
-                let long_price = pair.long_leg.current_price;
-                let short_price = pair.short_leg.current_price;
+                // For post-only buys, use best_bid so we sit on the book.
+                // For post-only sells, use best_ask.
+                // Fall back to current_price (mid/mark) if book data isn't available.
+                let long_price = pair.long_leg.best_bid.unwrap_or(pair.long_leg.current_price);
+                let short_price = pair.short_leg.best_ask.unwrap_or(pair.short_leg.current_price);
                 info!(
                     long = %size_long,
                     short = %size_short,
@@ -131,8 +134,18 @@ impl ExecutionPolicy<PerpPerpPair> for PerpPerpExecutionEngine {
                 size_long,
                 size_short,
             } => {
-                let long_price = pair.long_leg.current_price;
-                let short_price = pair.short_leg.current_price;
+                // Rebalance uses post_only too — pick the correct book side
+                // based on the direction of each correction.
+                let long_price = if size_long.is_sign_positive() {
+                    pair.long_leg.best_bid.unwrap_or(pair.long_leg.current_price)
+                } else {
+                    pair.long_leg.best_ask.unwrap_or(pair.long_leg.current_price)
+                };
+                let short_price = if size_short.is_sign_positive() {
+                    pair.short_leg.best_bid.unwrap_or(pair.short_leg.current_price)
+                } else {
+                    pair.short_leg.best_ask.unwrap_or(pair.short_leg.current_price)
+                };
                 info!(
                     long = %size_long,
                     short = %size_short,

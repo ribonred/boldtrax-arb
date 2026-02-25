@@ -72,4 +72,16 @@ impl PriceSource for PriceOracle {
             .get(key)
             .map(|s| s.bids.iter().take(DEPTH_LEVELS).map(|l| l.quantity).sum())
     }
+
+    fn get_bid_at_level(&self, key: &InstrumentKey, level: usize) -> Option<Decimal> {
+        self.snapshots
+            .get(key)
+            .and_then(|s| s.bids.get(level).map(|l| l.price))
+    }
+
+    fn get_ask_at_level(&self, key: &InstrumentKey, level: usize) -> Option<Decimal> {
+        self.snapshots
+            .get(key)
+            .and_then(|s| s.asks.get(level).map(|l| l.price))
+    }
 }

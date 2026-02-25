@@ -1,12 +1,12 @@
 //! WebSocket policies for Bybit V5.
 //!
 //! Bybit V5 WS differs from Binance/Aster:
-//! - Subscribe via JSON message: `{"op":"subscribe","args":["orderbook.1.BTCUSDT"]}`
+//! - Subscribe via JSON message: `{"op":"subscribe","args":["orderbook.50.BTCUSDT"]}`
 //! - Heartbeat: send `{"op":"ping"}` every 20 seconds
 //! - Messages have `topic`, `type`, `ts`, `data` fields
-//! - Level 1 orderbook has snapshot-only messages (no delta)
+//! - Level 1: snapshot-only messages; Level 50+: snapshot first, then delta updates
 
-use crate::bybit::mappers::{order_book_to_snapshot, ws_order_to_order_event, ws_position_to_patch};
+use crate::bybit::mappers::{ws_order_to_order_event, ws_position_to_patch};
 use crate::bybit::types::{
     BybitOrderBookResult, BybitWsControl, BybitWsOrderUpdate, BybitWsPositionUpdate,
     BybitWsPrivateMessage,
@@ -14,12 +14,17 @@ use crate::bybit::types::{
 use async_trait::async_trait;
 use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::registry::InstrumentRegistry;
-use boldtrax_core::types::{Exchange, InstrumentKey, InstrumentType, OrderBookUpdate, OrderEvent};
+use boldtrax_core::types::{
+    Exchange, InstrumentKey, InstrumentType, OrderBookSnapshot, OrderBookUpdate, OrderEvent,
+    PriceLevel,
+};
 use boldtrax_core::ws::WsPolicy;
 use futures_util::SinkExt;
 use futures_util::stream::SplitStream;
+use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -53,8 +58,94 @@ pub struct BybitDepthPolicy {
     pub symbol_map: HashMap<String, InstrumentKey>,
     /// Channel to send parsed snapshots
     pub tx: mpsc::Sender<OrderBookUpdate>,
-    /// Depth level to subscribe to (1, 50, 200, 1000)
+    /// Depth level to subscribe to (1, 50, 200, 500)
     pub depth: u32,
+    /// Local book state per symbol for incremental delta processing.
+    /// Only meaningful for depth > 1 (depth=1 is snapshot-only).
+    pub books: HashMap<String, LocalBook>,
+}
+
+/// Maintains a sorted order book from Bybit WS snapshot + delta messages.
+///
+/// Bids are stored descending (highest first), asks ascending (lowest first)
+/// via BTreeMap iteration order + reverse for bids.
+pub struct LocalBook {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+}
+
+impl Default for LocalBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalBook {
+    pub fn new() -> Self {
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, raw_bids: &[[String; 2]], raw_asks: &[[String; 2]]) {
+        self.bids.clear();
+        self.asks.clear();
+        Self::merge_into(&mut self.bids, raw_bids);
+        Self::merge_into(&mut self.asks, raw_asks);
+    }
+
+    pub fn apply_delta(&mut self, raw_bids: &[[String; 2]], raw_asks: &[[String; 2]]) {
+        Self::delta_into(&mut self.bids, raw_bids);
+        Self::delta_into(&mut self.asks, raw_asks);
+    }
+
+    pub fn to_snapshot(&self, key: InstrumentKey, ts_ms: u64) -> Option<OrderBookSnapshot> {
+        let bids: Vec<PriceLevel> = self
+            .bids
+            .iter()
+            .rev()
+            .map(|(&price, &quantity)| PriceLevel { price, quantity })
+            .collect();
+        let asks: Vec<PriceLevel> = self
+            .asks
+            .iter()
+            .map(|(&price, &quantity)| PriceLevel { price, quantity })
+            .collect();
+
+        let timestamp_utc = chrono::DateTime::from_timestamp_millis(ts_ms as i64)?;
+        Some(OrderBookSnapshot::new(
+            key,
+            bids,
+            asks,
+            timestamp_utc,
+            ts_ms as i64,
+        ))
+    }
+
+    fn merge_into(map: &mut BTreeMap<Decimal, Decimal>, levels: &[[String; 2]]) {
+        for level in levels {
+            if let (Ok(price), Ok(qty)) =
+                (Decimal::from_str(&level[0]), Decimal::from_str(&level[1]))
+            {
+                map.insert(price, qty);
+            }
+        }
+    }
+
+    fn delta_into(map: &mut BTreeMap<Decimal, Decimal>, levels: &[[String; 2]]) {
+        for level in levels {
+            if let (Ok(price), Ok(qty)) =
+                (Decimal::from_str(&level[0]), Decimal::from_str(&level[1]))
+            {
+                if qty.is_zero() {
+                    map.remove(&price);
+                } else {
+                    map.insert(price, qty);
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -148,7 +239,20 @@ impl WsPolicy for BybitDepthPolicy {
         };
 
         if let Some(key) = self.symbol_map.get(symbol) {
-            if let Some(snapshot) = order_book_to_snapshot(&data, *key) {
+            let is_delta = msg.msg_type.as_deref() == Some("delta");
+            let ts = msg
+                .ts
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+
+            let book = self.books.entry(symbol.to_string()).or_default();
+
+            if is_delta {
+                book.apply_delta(&data.b, &data.a);
+            } else {
+                book.apply_snapshot(&data.b, &data.a);
+            }
+
+            if let Some(snapshot) = book.to_snapshot(*key, ts) {
                 let update = OrderBookUpdate { snapshot };
                 if self.tx.try_send(update).is_err() {
                     warn!("Bybit depth channel full or closed");
@@ -305,7 +409,10 @@ impl WsPolicy for BybitUserDataPolicy {
                 }
                 ("auth", _) => {
                     let reason = msg.ret_msg.as_deref().unwrap_or("unknown");
-                    warn!(reason = reason, "Bybit private WS auth failed; supervisor will reconnect");
+                    warn!(
+                        reason = reason,
+                        "Bybit private WS auth failed; supervisor will reconnect"
+                    );
                     return Err(anyhow::anyhow!("Bybit private WS auth failed: {reason}"));
                 }
                 ("subscribe", Some(false)) => {
