@@ -1,5 +1,6 @@
 pub mod aster;
 pub mod binance;
+pub mod bybit;
 pub mod okx;
 
 use boldtrax_core::types::{Exchange, InstrumentKey};
@@ -14,6 +15,7 @@ pub fn get_available_wizards() -> Vec<Box<dyn ExchangeWizard>> {
     vec![
         Box::new(aster::AsterWizard),
         Box::new(binance::BinanceWizard),
+        Box::new(bybit::BybitWizard),
         Box::new(okx::OkxWizard),
     ]
 }

@@ -164,6 +164,87 @@ pub fn apply_binance_hmac_auth(
     Ok(())
 }
 
+/// Apply Bybit V5 HMAC-SHA256 authentication to a [`Request`].
+///
+/// Bybit uses a completely different signing scheme from Binance:
+/// - Signature string: `{timestamp}{api_key}{recv_window}{payload}`
+///   where payload = query string for GET/DELETE, raw JSON body for POST/PUT
+/// - Signature placed in `X-BAPI-SIGN` header (not a query param)
+/// - API key in `X-BAPI-API-KEY` header
+/// - Timestamp in `X-BAPI-TIMESTAMP` header
+/// - Recv window in `X-BAPI-RECV-WINDOW` header
+pub fn apply_bybit_hmac_auth(
+    request: &mut Request,
+    api_key: &str,
+    api_secret: &str,
+    recv_window_ms: u64,
+    timestamp_ms: u64,
+) -> Result<(), ClientError> {
+    let timestamp = timestamp_ms.to_string();
+    let recv_window = recv_window_ms.to_string();
+
+    // Payload depends on method:
+    //  - GET/DELETE: the query string (without leading '?')
+    //  - POST/PUT:  the raw JSON body
+    let payload = match *request.method() {
+        reqwest::Method::GET | reqwest::Method::DELETE => {
+            request.url().query().unwrap_or("").to_string()
+        }
+        _ => request
+            .body()
+            .and_then(|b| b.as_bytes())
+            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+            .unwrap_or_default(),
+    };
+
+    // Sign: timestamp + api_key + recv_window + payload
+    let sign_str = format!("{}{}{}{}", timestamp, api_key, recv_window, payload);
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(api_secret.as_bytes())
+        .map_err(|_| ClientError::AuthError("invalid HMAC key (api_secret)".to_string()))?;
+    mac.update(sign_str.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+
+    let headers = request.headers_mut();
+
+    let set_header = |headers: &mut reqwest::header::HeaderMap,
+                      name: &'static str,
+                      value: &str|
+     -> Result<(), ClientError> {
+        let header_name = HeaderName::from_static(name);
+        let header_value = value.parse().map_err(|_| {
+            ClientError::AuthError(format!(
+                "Bybit auth header '{}' contains invalid characters",
+                name,
+            ))
+        })?;
+        headers.insert(header_name, header_value);
+        Ok(())
+    };
+
+    set_header(headers, "x-bapi-api-key", api_key)?;
+    set_header(headers, "x-bapi-timestamp", &timestamp)?;
+    set_header(headers, "x-bapi-recv-window", &recv_window)?;
+    set_header(headers, "x-bapi-sign", &signature)?;
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Crypto utilities
+// ──────────────────────────────────────────────────────────────────
+
+/// Compute HMAC-SHA256 and return the hex-encoded digest.
+///
+/// Exposed so exchange-level tests can independently verify signatures
+/// without pulling in `hmac` / `sha2` / `hex` directly.
+pub fn hmac_sha256_hex(secret: &[u8], data: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(data);
+    hex::encode(mac.finalize().into_bytes())
+}
+
 // ──────────────────────────────────────────────────────────────────
 // WebSocket authentication
 // ──────────────────────────────────────────────────────────────────

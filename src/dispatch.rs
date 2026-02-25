@@ -9,6 +9,7 @@ use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::types::{Exchange, ExecutionMode};
 use exchanges::aster::client::{AsterClient, AsterConfig};
 use exchanges::binance::{BinanceClient, BinanceConfig};
+use exchanges::bybit::client::{BybitClient, BybitConfig};
 use exchanges::mock::MockExchange;
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -27,6 +28,7 @@ pub async fn spawn_exchange_runner(
     match exchange_name {
         "binance" => spawn_binance(app_config, exchange).await,
         "aster" => spawn_aster(app_config, exchange).await,
+        "bybit" => spawn_bybit(app_config, exchange).await,
         other => bail!(
             "spawn_exchange_runner: Exchange '{}' is not yet implemented",
             other
@@ -96,6 +98,46 @@ async fn spawn_aster(
 
     let registry = InstrumentRegistry::new();
     let client = AsterClient::new(aster_config, registry.clone())?;
+
+    let runner_config = ExchangeRunnerConfig::from_app_config(app_config, exchange, tracked_keys);
+
+    let handle = match app_config.execution_mode {
+        ExecutionMode::Paper => {
+            let mock = MockExchange::new(client, exchange, registry.clone());
+            let runner = ExchangeRunner::new(mock, runner_config, registry);
+            tokio::spawn(async move { runner.run().await })
+        }
+        ExecutionMode::Live => {
+            let runner = ExchangeRunner::new(client, runner_config, registry);
+            tokio::spawn(async move { runner.run().await })
+        }
+    };
+
+    Ok(handle)
+}
+
+async fn spawn_bybit(
+    app_config: &AppConfig,
+    exchange: Exchange,
+) -> anyhow::Result<JoinHandle<Result<(), RunnerError>>> {
+    let bybit_config = BybitConfig::from_app_config(app_config)?;
+    bybit_config.validate(app_config.execution_mode);
+
+    let tracked_keys = bybit_config.tracked_keys();
+    if tracked_keys.is_empty() {
+        eprintln!("[FATAL] No instruments configured for Bybit.");
+        eprintln!("Add instruments to config/exchanges/bybit.toml");
+        std::process::exit(1);
+    }
+
+    info!(
+        exchange = "bybit",
+        instruments = tracked_keys.len(),
+        "Starting exchange runner"
+    );
+
+    let registry = InstrumentRegistry::new();
+    let client = BybitClient::new(bybit_config, registry.clone())?;
 
     let runner_config = ExchangeRunnerConfig::from_app_config(app_config, exchange, tracked_keys);
 

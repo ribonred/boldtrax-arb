@@ -169,6 +169,17 @@ pub enum FundingInterval {
     rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
 )]
 #[archive(check_bytes)]
+#[repr(u8)]
+pub enum InstrumentSubType {
+    Straight,
+    Quanto,
+    Inverse,
+}
+
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash,
+)]
+#[archive(check_bytes)]
 pub struct InstrumentKey {
     pub exchange: Exchange,
     pub pair: Pairs,

@@ -10,6 +10,7 @@ use boldtrax_core::types::{Exchange, InstrumentKey, OrderEvent};
 use chrono::Utc;
 use exchanges::aster::client::{AsterClient, AsterConfig};
 use exchanges::binance::{BinanceClient, BinanceConfig};
+use exchanges::bybit::client::{BybitClient, BybitConfig};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::time::Duration;
@@ -39,6 +40,16 @@ pub async fn run_probe(
         Exchange::Aster => {
             let config = AsterConfig::from_app_config(app_config)?;
             let client = AsterClient::new(config, registry.clone())?;
+            probe_client(&client, registry, instrument.clone()).await?;
+            probe_account_client(&client).await?;
+            probe_position_client(&client, instrument.clone()).await?;
+            probe_open_orders(&client, instrument.clone()).await?;
+            probe_execution_stream(&client).await?;
+            probe_position_stream(&client).await?;
+        }
+        Exchange::Bybit => {
+            let config = BybitConfig::from_app_config(app_config)?;
+            let client = BybitClient::new(config, registry.clone())?;
             probe_client(&client, registry, instrument.clone()).await?;
             probe_account_client(&client).await?;
             probe_position_client(&client, instrument.clone()).await?;
