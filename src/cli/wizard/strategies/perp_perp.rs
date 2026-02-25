@@ -89,7 +89,6 @@ impl StrategyWizard for PerpPerpWizard {
         let liquidation_buffer_pct =
             prompt_decimal("Liquidation buffer (% of mark price):", Decimal::from(15))?;
 
-        // ── Polling parameters ────────────────────────────────────────
         let poll_interval_secs = prompt_decimal(
             "Poll interval for funding rates (seconds):",
             Decimal::from(30),
@@ -98,7 +97,6 @@ impl StrategyWizard for PerpPerpWizard {
         let cache_staleness_secs =
             prompt_decimal("Cache staleness threshold (seconds):", Decimal::from(60))?;
 
-        // ── Build TOML table ──────────────────────────────────────────
         let mut map = toml::map::Map::new();
         map.insert(
             "carry_direction".to_string(),

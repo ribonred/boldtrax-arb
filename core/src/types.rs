@@ -3,30 +3,6 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::Signed;
 use strum::{Display, EnumProperty, EnumString};
 
-// currency we care about
-#[derive(
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    EnumString,
-    Display,
-)]
-#[archive(check_bytes)]
-#[repr(u8)]
-pub enum Currency {
-    BTC,
-    ETH,
-    XRP,
-    USDT,
-    USDC,
-    SOL,
-}
 // instrument types we care about
 #[derive(
     rkyv::Archive,
@@ -80,6 +56,8 @@ pub enum Exchange {
     Aster,
     #[strum(to_string = "okx", serialize = "OK", props(short_code = "OK"))]
     Okx,
+    #[strum(to_string = "hyperliquid", serialize = "HL", props(short_code = "HL"))]
+    Hyperliquid,
 }
 
 impl Exchange {
@@ -88,6 +66,31 @@ impl Exchange {
     }
 }
 
+// currency we care about
+#[derive(
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumString,
+    Display,
+)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum Currency {
+    BTC,
+    ETH,
+    XRP,
+    USDT,
+    USDC,
+    SOL,
+    BNB,
+}
 // list of pairs we care about
 #[derive(
     rkyv::Archive,
@@ -111,6 +114,7 @@ pub enum Pairs {
     XRPUSDT,
     USDCUSDT,
     SOLUSDT,
+    BNBUSDT,
 }
 
 impl Pairs {
@@ -121,6 +125,7 @@ impl Pairs {
             Pairs::XRPUSDT => Currency::XRP,
             Pairs::USDCUSDT => Currency::USDC,
             Pairs::SOLUSDT => Currency::SOL,
+            Pairs::BNBUSDT => Currency::BNB,
         }
     }
 
@@ -131,6 +136,7 @@ impl Pairs {
             Pairs::XRPUSDT => Currency::USDT,
             Pairs::USDCUSDT => Currency::USDT,
             Pairs::SOLUSDT => Currency::USDT,
+            Pairs::BNBUSDT => Currency::USDT,
         }
     }
 
@@ -141,6 +147,7 @@ impl Pairs {
             (Currency::XRP, Currency::USDT) => Some(Pairs::XRPUSDT),
             (Currency::USDC, Currency::USDT) => Some(Pairs::USDCUSDT),
             (Currency::SOL, Currency::USDT) => Some(Pairs::SOLUSDT),
+            (Currency::BNB, Currency::USDT) => Some(Pairs::BNBUSDT),
             _ => None,
         }
     }

@@ -1,3 +1,4 @@
+pub mod aster;
 pub mod binance;
 pub mod okx;
 
@@ -10,7 +11,11 @@ pub trait ExchangeWizard {
 }
 
 pub fn get_available_wizards() -> Vec<Box<dyn ExchangeWizard>> {
-    vec![Box::new(binance::BinanceWizard), Box::new(okx::OkxWizard)]
+    vec![
+        Box::new(aster::AsterWizard),
+        Box::new(binance::BinanceWizard),
+        Box::new(okx::OkxWizard),
+    ]
 }
 
 pub fn prompt_instruments(exchange: Exchange) -> anyhow::Result<Vec<toml::Value>> {

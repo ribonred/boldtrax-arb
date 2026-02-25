@@ -5,3 +5,5 @@ pub mod errors;
 pub use auth::*;
 pub use client::*;
 pub use errors::*;
+
+pub use reqwest;

@@ -1,7 +1,8 @@
 //! Binance exchange client
 
+use crate::binance::auth::BinanceHmacAuth;
 use async_trait::async_trait;
-use boldtrax_core::http::{BinanceHmacAuth, HttpClientBuilder, ResponseExt, TracedHttpClient};
+use boldtrax_core::http::{HttpClientBuilder, ResponseExt, TracedHttpClient};
 use boldtrax_core::manager::account::{AccountManagerError, AccountSnapshotSource};
 use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::registry::InstrumentRegistry;
@@ -654,9 +655,15 @@ impl OrderExecutionProvider for BinanceClient {
                 let resp = client.delete(&path).await.map_err(TradingError::from)?;
                 let order_resp: BinanceOrderResponse =
                     resp.json_logged("futures cancel_order").await?;
-                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
-                    TradingError::Parse("failed to parse futures cancel_order response".to_string())
-                })
+                let strategy_id = BinanceClientOrderIdCodec
+                    .decode_strategy_id(order_id)
+                    .unwrap();
+                binance_order_response_to_order(&order_resp, key, &strategy_id, order_id)
+                    .ok_or_else(|| {
+                        TradingError::Parse(
+                            "failed to parse futures cancel_order response".to_string(),
+                        )
+                    })
             }
             InstrumentType::Spot => {
                 let client = self.spot_private_client()?;
@@ -665,9 +672,15 @@ impl OrderExecutionProvider for BinanceClient {
                 let resp = client.delete(&path).await.map_err(TradingError::from)?;
                 let order_resp: BinanceOrderResponse =
                     resp.json_logged("spot cancel_order").await?;
-                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
-                    TradingError::Parse("failed to parse spot cancel_order response".to_string())
-                })
+                let strategy_id = BinanceClientOrderIdCodec
+                    .decode_strategy_id(order_id)
+                    .unwrap();
+                binance_order_response_to_order(&order_resp, key, &strategy_id, order_id)
+                    .ok_or_else(|| {
+                        TradingError::Parse(
+                            "failed to parse spot cancel_order response".to_string(),
+                        )
+                    })
             }
         }
     }
@@ -689,7 +702,12 @@ impl OrderExecutionProvider for BinanceClient {
                     resp.json_logged("futures get_open_orders").await?;
                 Ok(orders
                     .iter()
-                    .filter_map(|o| binance_order_response_to_order(o, key, "", &o.client_order_id))
+                    .filter_map(|o| {
+                        let strategy_id = BinanceClientOrderIdCodec
+                            .decode_strategy_id(&o.client_order_id)
+                            .unwrap();
+                        binance_order_response_to_order(o, key, &strategy_id, &o.client_order_id)
+                    })
                     .collect())
             }
             InstrumentType::Spot => {
@@ -701,7 +719,12 @@ impl OrderExecutionProvider for BinanceClient {
                     resp.json_logged("spot get_open_orders").await?;
                 Ok(orders
                     .iter()
-                    .filter_map(|o| binance_order_response_to_order(o, key, "", &o.client_order_id))
+                    .filter_map(|o| {
+                        let strategy_id = BinanceClientOrderIdCodec
+                            .decode_strategy_id(&o.client_order_id)
+                            .unwrap();
+                        binance_order_response_to_order(o, key, &strategy_id, &o.client_order_id)
+                    })
                     .collect())
             }
         }
@@ -726,9 +749,15 @@ impl OrderExecutionProvider for BinanceClient {
                 let resp = client.get(&path).await.map_err(TradingError::from)?;
                 let order_resp: BinanceOrderResponse =
                     resp.json_logged("futures get_order_status").await?;
-                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
-                    TradingError::Parse("failed to parse futures order status response".to_string())
-                })
+                let strategy_id = BinanceClientOrderIdCodec
+                    .decode_strategy_id(order_id)
+                    .unwrap();
+                binance_order_response_to_order(&order_resp, key, &strategy_id, order_id)
+                    .ok_or_else(|| {
+                        TradingError::Parse(
+                            "failed to parse futures order status response".to_string(),
+                        )
+                    })
             }
             InstrumentType::Spot => {
                 let client = self.spot_private_client()?;
@@ -737,9 +766,15 @@ impl OrderExecutionProvider for BinanceClient {
                 let resp = client.get(&path).await.map_err(TradingError::from)?;
                 let order_resp: BinanceOrderResponse =
                     resp.json_logged("spot get_order_status").await?;
-                binance_order_response_to_order(&order_resp, key, "", order_id).ok_or_else(|| {
-                    TradingError::Parse("failed to parse spot order status response".to_string())
-                })
+                let strategy_id = BinanceClientOrderIdCodec
+                    .decode_strategy_id(order_id)
+                    .unwrap();
+                binance_order_response_to_order(&order_resp, key, &strategy_id, order_id)
+                    .ok_or_else(|| {
+                        TradingError::Parse(
+                            "failed to parse spot order status response".to_string(),
+                        )
+                    })
             }
         }
     }

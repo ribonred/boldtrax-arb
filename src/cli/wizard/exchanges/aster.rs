@@ -2,15 +2,15 @@ use super::{ExchangeWizard, prompt_instruments};
 use boldtrax_core::types::Exchange;
 use inquire::{Confirm, Text};
 
-pub struct BinanceWizard;
+pub struct AsterWizard;
 
-impl ExchangeWizard for BinanceWizard {
+impl ExchangeWizard for AsterWizard {
     fn exchange(&self) -> Exchange {
-        Exchange::Binance
+        Exchange::Aster
     }
 
     fn prompt(&self) -> anyhow::Result<toml::Value> {
-        println!("--- Binance Configuration ---");
+        println!("--- Aster Configuration ---");
 
         let testnet = Confirm::new("Use Testnet?").with_default(true).prompt()?;
 
@@ -37,13 +37,9 @@ impl ExchangeWizard for BinanceWizard {
                     toml::Value::String(futures_url),
                 );
             }
-            let spot_url = Text::new("Spot Base URL (leave blank for default):").prompt()?;
-            if !spot_url.is_empty() {
-                map.insert("spot_base_url".to_string(), toml::Value::String(spot_url));
-            }
         }
 
-        let instruments = prompt_instruments(Exchange::Binance)?;
+        let instruments = prompt_instruments(Exchange::Aster)?;
         if !instruments.is_empty() {
             map.insert("instruments".to_string(), toml::Value::Array(instruments));
         }

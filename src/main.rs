@@ -37,6 +37,15 @@ enum Commands {
         #[arg(short, long, default_value = "binance")]
         exchange: Exchange,
     },
+    /// Probe public endpoints of an exchange
+    Probe {
+        /// Exchange to probe
+        #[arg(short, long)]
+        exchange: Exchange,
+        /// Instrument key to probe (e.g., BTCUSDT-AS-SWAP)
+        #[arg(short, long)]
+        instrument: Option<String>,
+    },
     /// Initialize configuration via interactive wizard
     Wizard,
     /// Check configuration health
@@ -73,6 +82,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Manual { exchange } => {
             let app_config = load_and_validate_config();
             cli::manual::run_manual(&app_config, exchange).await?;
+        }
+        Commands::Probe {
+            exchange,
+            instrument,
+        } => {
+            let app_config = load_and_validate_config();
+            cli::probe::run_probe(&app_config, exchange, instrument).await?;
         }
         Commands::Run { mode } => {
             let app_config = load_and_validate_config();

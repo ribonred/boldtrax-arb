@@ -109,69 +109,59 @@ impl AuthProvider for NoAuth {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct BinanceHmacAuth {
-    api_key: String,
-    api_secret: String,
+pub fn apply_binance_hmac_auth(
+    request: &mut Request,
+    api_key: &str,
+    api_secret: &str,
     recv_window_ms: u64,
-}
+    extra_params: &[(&str, &str)],
+    strip_params: &[&str],
+) -> Result<(), ClientError> {
+    let url = request.url_mut();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .map_err(|_| ClientError::AuthError("system clock is before UNIX epoch".to_string()))?;
 
-impl BinanceHmacAuth {
-    pub fn new(api_key: String, api_secret: String) -> Self {
-        Self {
-            api_key,
-            api_secret,
-            recv_window_ms: 5_000,
-        }
+    // Strip any prior timestamp/signature/etc injected by a previous auth attempt (retry path)
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| {
+            k != "timestamp"
+                && k != "signature"
+                && k != "recvWindow"
+                && !strip_params.contains(&k.as_ref())
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    pairs.push(("timestamp".to_string(), now_ms.to_string()));
+    pairs.push(("recvWindow".to_string(), recv_window_ms.to_string()));
+    for (k, v) in extra_params {
+        pairs.push((k.to_string(), v.to_string()));
     }
 
-    pub fn with_recv_window_ms(mut self, recv_window_ms: u64) -> Self {
-        self.recv_window_ms = recv_window_ms;
-        self
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (k, v) in &pairs {
+        serializer.append_pair(k, v);
     }
-}
+    let query_to_sign = serializer.finish();
 
-#[async_trait]
-impl AuthProvider for BinanceHmacAuth {
-    async fn apply_auth(&self, request: &mut Request) -> Result<(), ClientError> {
-        let url = request.url_mut();
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|_| ClientError::AuthError("system clock is before UNIX epoch".to_string()))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(api_secret.as_bytes())
+        .map_err(|_| ClientError::AuthError("invalid HMAC key (api_secret)".to_string()))?;
+    mac.update(query_to_sign.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
 
-        // Strip any prior timestamp/signature injected by a previous auth attempt (retry path)
-        let mut pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .filter(|(k, _)| k != "timestamp" && k != "signature" && k != "recvWindow")
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
+    let final_query = format!("{}&signature={}", query_to_sign, signature);
+    url.set_query(Some(&final_query));
 
-        pairs.push(("timestamp".to_string(), now_ms.to_string()));
-        pairs.push(("recvWindow".to_string(), self.recv_window_ms.to_string()));
-
-        let mut serializer = form_urlencoded::Serializer::new(String::new());
-        for (k, v) in &pairs {
-            serializer.append_pair(k, v);
-        }
-        let query_to_sign = serializer.finish();
-
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.api_secret.as_bytes())
-            .map_err(|_| ClientError::AuthError("invalid HMAC key (api_secret)".to_string()))?;
-        mac.update(query_to_sign.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
-
-        let final_query = format!("{}&signature={}", query_to_sign, signature);
-        url.set_query(Some(&final_query));
-
-        let header_value = self.api_key.parse().map_err(|_| {
-            ClientError::AuthError("Binance API key contains invalid header characters".to_string())
-        })?;
-        request
-            .headers_mut()
-            .insert(HeaderName::from_static("x-mbx-apikey"), header_value);
-        Ok(())
-    }
+    let header_value = api_key.parse().map_err(|_| {
+        ClientError::AuthError("API key contains invalid header characters".to_string())
+    })?;
+    request
+        .headers_mut()
+        .insert(HeaderName::from_static("x-mbx-apikey"), header_value);
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -225,17 +215,14 @@ mod tests {
     use reqwest::Client;
     use url::Url;
 
-    /// Verifies that `BinanceHmacAuth` produces a well-formed, valid HMAC-SHA256 signature
+    /// Verifies that `apply_binance_hmac_auth` produces a well-formed, valid HMAC-SHA256 signature
     /// by independently recomputing the expected signature from the extracted query params.
     #[tokio::test]
     async fn binance_hmac_produces_valid_signature() {
-        let auth = BinanceHmacAuth::new("testApiKey".to_string(), "testSecretKey".to_string());
-
         let url = Url::parse("https://fapi.binance.com/fapi/v2/balance?orderId=123").unwrap();
         let mut request = Client::new().get(url).build().unwrap();
 
-        auth.apply_auth(&mut request)
-            .await
+        apply_binance_hmac_auth(&mut request, "testApiKey", "testSecretKey", 5000, &[], &[])
             .expect("apply_auth should not fail");
 
         let pairs: HashMap<String, String> = request
@@ -270,8 +257,6 @@ mod tests {
     /// (as happens on retry) strips the stale params and replaces them with fresh ones.
     #[tokio::test]
     async fn binance_hmac_strips_stale_signing_params_on_retry() {
-        let auth = BinanceHmacAuth::new("key".to_string(), "secret".to_string());
-
         let url = Url::parse(
             "https://api.binance.com/api/v3/account\
              ?timestamp=1000000&recvWindow=5000&signature=stalesig",
@@ -279,8 +264,7 @@ mod tests {
         .unwrap();
         let mut request = Client::new().get(url).build().unwrap();
 
-        auth.apply_auth(&mut request)
-            .await
+        apply_binance_hmac_auth(&mut request, "key", "secret", 5000, &[], &[])
             .expect("apply_auth should not fail");
 
         let pairs: Vec<(String, String)> = request

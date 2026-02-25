@@ -1,3 +1,4 @@
+pub mod aster;
 pub mod binance;
 pub mod mock;
 
