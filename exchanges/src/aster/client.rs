@@ -5,7 +5,8 @@ use boldtrax_core::config::types::ExchangeConfig;
 use boldtrax_core::http::{HttpClientBuilder, ResponseExt, TracedHttpClient};
 use boldtrax_core::manager::account::{AccountManagerError, AccountSnapshotSource};
 use boldtrax_core::manager::types::{
-    AccountModel, AccountPartitionRef, AccountSnapshot, BalanceView, CollateralScope, PartitionKind,
+    AccountModel, AccountPartitionRef, AccountSnapshot, BalanceView, CollateralScope,
+    PartitionKind, WsPositionPatch,
 };
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::traits::{
@@ -18,13 +19,13 @@ use boldtrax_core::types::{
     InstrumentKey, InstrumentType, Order, OrderBookSnapshot, OrderBookUpdate, OrderEvent,
     OrderRequest, OrderSide, OrderType, Position,
 };
-use boldtrax_core::ws::{CancellationToken, ws_supervisor_spawn};
+use boldtrax_core::ws::{CancellationToken, WsSupervisorHandle, ws_supervisor_spawn};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use tokio::sync::{OnceCell, mpsc};
-use tracing::{debug, info};
+use tokio::sync::{Mutex, OnceCell, mpsc};
+use tracing::{debug, info, warn};
 
 use crate::aster::codec::AsterClientOrderIdCodec;
 use crate::aster::mappers::{
@@ -36,7 +37,14 @@ use crate::aster::types::{
     AsterLeverageResponse, AsterOrderResponse, AsterPartialDepth, AsterPremiumIndex,
     AsterServerTime, AsterSwapMeta,
 };
-use crate::aster::ws::{AsterDepthPolicy, AsterUserDataPolicy};
+use crate::aster::ws::AsterDepthPolicy;
+use crate::aster::ws::AsterUserDataPolicy;
+
+struct UserDataHandle {
+    order_rx: Mutex<Option<mpsc::Receiver<OrderEvent>>>,
+    pos_rx: Mutex<Option<mpsc::Receiver<WsPositionPatch>>>,
+    _supervisor: WsSupervisorHandle,
+}
 
 const ASTER_FUTURES_BASE_URL: &str = "https://fapi.asterdex.com";
 const ASTER_FUTURES_TESTNET_URL: &str = "https://fapi.asterdex-testnet.com";
@@ -91,6 +99,17 @@ impl ExchangeConfig for AsterConfig {
     }
 }
 
+impl AsterConfig {
+    /// Resolve configured instrument strings into typed `InstrumentKey`s.
+    /// Invalid entries are silently skipped.
+    pub fn tracked_keys(&self) -> Vec<InstrumentKey> {
+        self.instruments
+            .iter()
+            .filter_map(|s| s.parse::<InstrumentKey>().ok())
+            .collect()
+    }
+}
+
 pub struct AsterClient {
     config: AsterConfig,
     public_client: TracedHttpClient,
@@ -98,6 +117,7 @@ pub struct AsterClient {
     registry: InstrumentRegistry,
     instruments_loaded: OnceCell<()>,
     leverage_map: RwLock<HashMap<InstrumentKey, rust_decimal::Decimal>>,
+    user_data: OnceCell<UserDataHandle>,
 }
 
 impl AsterClient {
@@ -140,6 +160,7 @@ impl AsterClient {
             registry,
             instruments_loaded: OnceCell::new(),
             leverage_map: RwLock::new(HashMap::new()),
+            user_data: OnceCell::new(),
         })
     }
 
@@ -389,6 +410,33 @@ impl AsterClient {
         })
     }
 
+    async fn ensure_user_data(&self) -> Result<&UserDataHandle, AccountError> {
+        self.user_data
+            .get_or_try_init(|| async {
+                let client = self.private_client()?.clone();
+                let base_ws_url = if self.config.testnet {
+                    ASTER_FUTURES_WS_TESTNET_URL
+                } else {
+                    ASTER_FUTURES_WS_BASE_URL
+                }
+                .to_string();
+
+                let (policy, channels) =
+                    AsterUserDataPolicy::new(client, base_ws_url, self.registry.clone());
+
+                let cancel = CancellationToken::new();
+                let supervisor = ws_supervisor_spawn(policy, cancel);
+                info!("Aster user-data supervisor spawned (shared)");
+
+                Ok(UserDataHandle {
+                    order_rx: Mutex::new(Some(channels.order_rx)),
+                    pos_rx: Mutex::new(Some(channels.pos_rx)),
+                    _supervisor: supervisor,
+                })
+            })
+            .await
+    }
+
     async fn fetch_futures_balances(
         &self,
     ) -> Result<Vec<crate::aster::types::AsterFuturesBalance>, AccountError> {
@@ -474,51 +522,6 @@ impl AccountSnapshotSource for AsterClient {
         self.account_snapshot()
             .await
             .map_err(AccountManagerError::SourceError)
-    }
-}
-
-#[async_trait]
-impl PositionProvider for AsterClient {
-    async fn fetch_positions(&self) -> Result<Vec<Position>, TradingError> {
-        let client = self.private_client()?;
-        debug!("Fetching Aster Futures position risk");
-        let resp = client
-            .get("/fapi/v2/positionRisk")
-            .await
-            .map_err(TradingError::from)?;
-        let risks: Vec<AsterFuturesPositionRisk> = resp
-            .json_logged("Aster positionRisk")
-            .await
-            .map_err(|e| TradingError::Parse(e.to_string()))?;
-
-        let positions: Vec<Position> = risks
-            .iter()
-            .filter_map(|risk| {
-                let instrument = self.registry.get_by_exchange_symbol(
-                    Exchange::Aster,
-                    &risk.symbol,
-                    InstrumentType::Swap,
-                )?;
-                aster_position_risk_to_position(risk, instrument.key)
-            })
-            .collect();
-
-        let leverage_map = self
-            .leverage_map
-            .read()
-            .expect("leverage_map lock poisoned");
-
-        let positions_with_leverage = positions
-            .into_iter()
-            .map(|mut pos| {
-                if let Some(&lev) = leverage_map.get(&pos.key) {
-                    pos.leverage = lev;
-                }
-                pos
-            })
-            .collect();
-
-        Ok(positions_with_leverage)
     }
 }
 
@@ -713,17 +716,17 @@ impl OrderExecutionProvider for AsterClient {
     }
 
     async fn stream_executions(&self, tx: mpsc::Sender<OrderEvent>) -> Result<(), AccountError> {
-        let client = self.private_client()?.clone();
-        let base_ws_url = if self.config.testnet {
-            ASTER_FUTURES_WS_TESTNET_URL
-        } else {
-            ASTER_FUTURES_WS_BASE_URL
-        }
-        .to_string();
+        let handle = self.ensure_user_data().await?;
+        let mut order_rx = match handle.order_rx.lock().await.take() {
+            Some(rx) => rx,
+            None => {
+                warn!("Aster order_rx already taken by a prior stream_executions call");
+                std::future::pending::<()>().await;
+                return Ok(());
+            }
+        };
 
         let cancel = CancellationToken::new();
-
-        // Cancel the supervisor when the receiver side of the channel is dropped.
         let cancel_on_close = cancel.clone();
         let tx_watcher = tx.clone();
         tokio::spawn(async move {
@@ -731,9 +734,107 @@ impl OrderExecutionProvider for AsterClient {
             cancel_on_close.cancel();
         });
 
-        let policy = AsterUserDataPolicy::new(client, base_ws_url, self.registry.clone(), tx);
-        let handle = ws_supervisor_spawn(policy, cancel);
-        handle.join().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = order_rx.recv() => {
+                    match msg {
+                        Some(event) => {
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PositionProvider for AsterClient {
+    async fn fetch_positions(&self) -> Result<Vec<Position>, TradingError> {
+        let client = self.private_client()?;
+        debug!("Fetching Aster Futures position risk");
+        let resp = client
+            .get("/fapi/v2/positionRisk")
+            .await
+            .map_err(TradingError::from)?;
+        let risks: Vec<AsterFuturesPositionRisk> = resp
+            .json_logged("Aster positionRisk")
+            .await
+            .map_err(|e| TradingError::Parse(e.to_string()))?;
+
+        let positions: Vec<Position> = risks
+            .iter()
+            .filter_map(|risk| {
+                let instrument = self.registry.get_by_exchange_symbol(
+                    Exchange::Aster,
+                    &risk.symbol,
+                    InstrumentType::Swap,
+                )?;
+                aster_position_risk_to_position(risk, instrument.key)
+            })
+            .collect();
+
+        let leverage_map = self
+            .leverage_map
+            .read()
+            .expect("leverage_map lock poisoned");
+
+        let positions_with_leverage = positions
+            .into_iter()
+            .map(|mut pos| {
+                if let Some(&lev) = leverage_map.get(&pos.key) {
+                    pos.leverage = lev;
+                }
+                pos
+            })
+            .collect();
+
+        Ok(positions_with_leverage)
+    }
+
+    async fn stream_position_updates(
+        &self,
+        tx: mpsc::Sender<WsPositionPatch>,
+    ) -> Result<(), AccountError> {
+        let handle = self.ensure_user_data().await?;
+        let mut pos_rx = match handle.pos_rx.lock().await.take() {
+            Some(rx) => rx,
+            None => {
+                warn!("Aster pos_rx already taken by a prior stream_position_updates call");
+                std::future::pending::<()>().await;
+                return Ok(());
+            }
+        };
+
+        let cancel = CancellationToken::new();
+        let cancel_on_close = cancel.clone();
+        let tx_watcher = tx.clone();
+        tokio::spawn(async move {
+            tx_watcher.closed().await;
+            cancel_on_close.cancel();
+        });
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = pos_rx.recv() => {
+                    match msg {
+                        Some(patch) => {
+                            if tx.send(patch).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

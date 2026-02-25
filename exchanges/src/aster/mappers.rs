@@ -1,7 +1,8 @@
 use super::types::{
     AsterFundingRateHistory, AsterFuturesOrderTradeUpdate, AsterFuturesPositionRisk,
-    AsterOrderResponse, AsterPartialDepth, AsterPremiumIndex,
+    AsterFuturesWsPosition, AsterOrderResponse, AsterPartialDepth, AsterPremiumIndex,
 };
+use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::types::{
     FundingInterval, FundingRateSeries, FundingRateSnapshot, InstrumentKey, Order,
     OrderBookSnapshot, OrderEvent, OrderRequest, OrderSide, OrderStatus, OrderType, Pairs,
@@ -272,4 +273,24 @@ pub fn aster_execution_to_order_event(
     };
 
     Some(order.into())
+}
+
+/// Convert a WebSocket `ACCOUNT_UPDATE` position entry to a [`WsPositionPatch`].
+///
+/// A zero `size` is a valid "position closed" signal that the
+/// `PositionManagerActor` needs to act on.  Returns `None` only when the
+/// numeric fields cannot be parsed.
+pub fn ws_position_to_patch(
+    ws_pos: &AsterFuturesWsPosition,
+    key: InstrumentKey,
+) -> Option<WsPositionPatch> {
+    let size = Decimal::from_str(&ws_pos.position_amt).ok()?;
+    let entry_price = Decimal::from_str(&ws_pos.entry_price).ok()?;
+    let unrealized_pnl = Decimal::from_str(&ws_pos.unrealized_profit).ok()?;
+    Some(WsPositionPatch {
+        key,
+        size,
+        entry_price,
+        unrealized_pnl,
+    })
 }

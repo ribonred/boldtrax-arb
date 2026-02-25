@@ -156,45 +156,46 @@ pub struct BinanceFuturesUserDataPolicy {
     base_ws_url: String,
     listen_key: String,
     registry: InstrumentRegistry,
-    /// Order execution sink — `None` when used purely for position streaming.
-    order_tx: Option<mpsc::Sender<OrderEvent>>,
-    /// Position update sink — `None` when used purely for order execution streaming.
-    pos_tx: Option<mpsc::Sender<WsPositionPatch>>,
+    /// Order execution sink — always present; events are dropped if no consumer.
+    order_tx: mpsc::Sender<OrderEvent>,
+    /// Position update sink — always present; events are dropped if no consumer.
+    pos_tx: mpsc::Sender<WsPositionPatch>,
+}
+
+/// Receivers returned by [`BinanceFuturesUserDataPolicy::new`].
+///
+/// Each receiver corresponds to one event type dispatched by the policy.
+/// Consumers (trait methods) take their receiver and relay into the
+/// caller-provided `mpsc::Sender`.
+pub struct FuturesUserDataChannels {
+    pub order_rx: mpsc::Receiver<OrderEvent>,
+    pub pos_rx: mpsc::Receiver<WsPositionPatch>,
 }
 
 impl BinanceFuturesUserDataPolicy {
-    /// Primary constructor for order execution streaming (used by `stream_executions`).
+    /// Create a new policy that owns its internal channels.
+    ///
+    /// Returns `(policy, channels)`.  The policy keeps the tx halves and
+    /// dispatches both `ORDER_TRADE_UPDATE` and `ACCOUNT_UPDATE` via
+    /// `try_send`.  Callers take the rx halves from `channels` and relay
+    /// events into the trait-provided senders.
     pub fn new(
         client: TracedHttpClient,
         base_ws_url: String,
         registry: InstrumentRegistry,
-        tx: mpsc::Sender<OrderEvent>,
-    ) -> Self {
-        Self {
+    ) -> (Self, FuturesUserDataChannels) {
+        let (order_tx, order_rx) = mpsc::channel(256);
+        let (pos_tx, pos_rx) = mpsc::channel(64);
+        let policy = Self {
             client,
             base_ws_url,
             listen_key: String::new(),
             registry,
-            order_tx: Some(tx),
-            pos_tx: None,
-        }
-    }
-
-    /// Constructor for position-only streaming (used by `stream_position_updates`).
-    pub fn new_for_positions(
-        client: TracedHttpClient,
-        base_ws_url: String,
-        registry: InstrumentRegistry,
-        pos_tx: mpsc::Sender<WsPositionPatch>,
-    ) -> Self {
-        Self {
-            client,
-            base_ws_url,
-            listen_key: String::new(),
-            registry,
-            order_tx: None,
-            pos_tx: Some(pos_tx),
-        }
+            order_tx,
+            pos_tx,
+        };
+        let channels = FuturesUserDataChannels { order_rx, pos_rx };
+        (policy, channels)
     }
 }
 
@@ -252,58 +253,62 @@ impl WsPolicy for BinanceFuturesUserDataPolicy {
 
         match serde_json::from_str::<BinanceFuturesUserDataEvent>(&text) {
             Ok(BinanceFuturesUserDataEvent::OrderTradeUpdate { order: report }) => {
-                if let Some(ref tx) = self.order_tx {
-                    info!(
-                        symbol = %report.symbol,
-                        client_order_id = %report.client_order_id,
-                        side = %report.side,
-                        order_type = %report.order_type,
-                        order_status = %report.order_status,
-                        filled_qty = %report.order_filled_accumulated_quantity,
-                        avg_price = %report.average_price,
-                        "Futures ORDER_TRADE_UPDATE received"
-                    );
-                    if let Some(event) = self
-                        .registry
-                        .get_by_exchange_symbol(
-                            Exchange::Binance,
-                            &report.symbol,
-                            InstrumentType::Swap,
-                        )
-                        .and_then(|inst| futures_execution_to_order_event(&report, inst.key))
-                    {
-                        if tx.send(event).await.is_err() {
-                            return Err(anyhow::anyhow!("futures execution channel closed"));
+                info!(
+                    symbol = %report.symbol,
+                    client_order_id = %report.client_order_id,
+                    side = %report.side,
+                    order_type = %report.order_type,
+                    order_status = %report.order_status,
+                    filled_qty = %report.order_filled_accumulated_quantity,
+                    avg_price = %report.average_price,
+                    "Futures ORDER_TRADE_UPDATE received"
+                );
+                if let Some(event) = self
+                    .registry
+                    .get_by_exchange_symbol(Exchange::Binance, &report.symbol, InstrumentType::Swap)
+                    .and_then(|inst| futures_execution_to_order_event(&report, inst.key))
+                {
+                    match self.order_tx.try_send(event) {
+                        Ok(_) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(symbol = %report.symbol, "Order event channel full; dropping");
                         }
-                    } else {
-                        warn!(symbol = %report.symbol, "Futures execution for untracked symbol or parse failed");
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            debug!(symbol = %report.symbol, "Order event channel closed; no consumer");
+                        }
                     }
+                } else {
+                    warn!(symbol = %report.symbol, "Futures execution for untracked symbol or parse failed");
                 }
             }
             Ok(BinanceFuturesUserDataEvent::AccountUpdate { update }) => {
-                if let Some(ref tx) = self.pos_tx {
-                    for ws_pos in &update.positions {
-                        if let Some(instrument) = self.registry.get_by_exchange_symbol(
-                            Exchange::Binance,
-                            &ws_pos.symbol,
-                            InstrumentType::Swap,
-                        ) {
-                            match ws_position_to_patch(ws_pos, instrument.key) {
-                                Some(patch) => {
-                                    debug!(
-                                        symbol = %ws_pos.symbol,
-                                        size = %patch.size,
-                                        entry_price = %patch.entry_price,
-                                        unrealized_pnl = %patch.unrealized_pnl,
-                                        "ACCOUNT_UPDATE position patch"
-                                    );
-                                    if tx.send(patch).await.is_err() {
-                                        return Err(anyhow::anyhow!("position channel closed"));
+                for ws_pos in &update.positions {
+                    if let Some(instrument) = self.registry.get_by_exchange_symbol(
+                        Exchange::Binance,
+                        &ws_pos.symbol,
+                        InstrumentType::Swap,
+                    ) {
+                        match ws_position_to_patch(ws_pos, instrument.key) {
+                            Some(patch) => {
+                                debug!(
+                                    symbol = %ws_pos.symbol,
+                                    size = %patch.size,
+                                    entry_price = %patch.entry_price,
+                                    unrealized_pnl = %patch.unrealized_pnl,
+                                    "ACCOUNT_UPDATE position patch"
+                                );
+                                match self.pos_tx.try_send(patch) {
+                                    Ok(_) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!(symbol = %ws_pos.symbol, "Position channel full; dropping patch");
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        debug!(symbol = %ws_pos.symbol, "Position channel closed; no consumer");
                                     }
                                 }
-                                None => {
-                                    warn!(symbol = %ws_pos.symbol, "Failed to parse ACCOUNT_UPDATE position fields");
-                                }
+                            }
+                            None => {
+                                warn!(symbol = %ws_pos.symbol, "Failed to parse ACCOUNT_UPDATE position fields");
                             }
                         }
                     }

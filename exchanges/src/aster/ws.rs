@@ -1,7 +1,10 @@
-use crate::aster::mappers::{aster_execution_to_order_event, partial_depth_to_order_book};
+use crate::aster::mappers::{
+    aster_execution_to_order_event, partial_depth_to_order_book, ws_position_to_patch,
+};
 use crate::aster::types::{AsterFuturesUserDataEvent, AsterListenKeyResponse, AsterPartialDepth};
 use async_trait::async_trait;
 use boldtrax_core::http::TracedHttpClient;
+use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::registry::InstrumentRegistry;
 use boldtrax_core::types::{Exchange, InstrumentKey, InstrumentType, OrderBookUpdate, OrderEvent};
 use boldtrax_core::ws::WsPolicy;
@@ -69,13 +72,20 @@ impl WsPolicy for AsterDepthPolicy {
 /// - **`heartbeat_interval()`**: 30 minutes.
 /// - **`send_heartbeat()`**: PUTs `/fapi/v1/listenKey?listenKey=…` to keep the
 ///   key alive.
-/// - **`parse_message()`**: Routes `ORDER_TRADE_UPDATE` events to the order sink.
+/// - **`parse_message()`**: Routes `ORDER_TRADE_UPDATE` events to the order sink
+///   and `ACCOUNT_UPDATE` position entries to the position sink.
 pub struct AsterUserDataPolicy {
     client: TracedHttpClient,
     base_ws_url: String,
     listen_key: String,
     registry: InstrumentRegistry,
     order_tx: mpsc::Sender<OrderEvent>,
+    pos_tx: mpsc::Sender<WsPositionPatch>,
+}
+
+pub struct UserDataChannels {
+    pub order_rx: mpsc::Receiver<OrderEvent>,
+    pub pos_rx: mpsc::Receiver<WsPositionPatch>,
 }
 
 impl AsterUserDataPolicy {
@@ -83,15 +93,19 @@ impl AsterUserDataPolicy {
         client: TracedHttpClient,
         base_ws_url: String,
         registry: InstrumentRegistry,
-        tx: mpsc::Sender<OrderEvent>,
-    ) -> Self {
-        Self {
+    ) -> (Self, UserDataChannels) {
+        let (order_tx, order_rx) = mpsc::channel(256);
+        let (pos_tx, pos_rx) = mpsc::channel(64);
+        let policy = Self {
             client,
             base_ws_url,
             listen_key: String::new(),
             registry,
-            order_tx: tx,
-        }
+            order_tx,
+            pos_tx,
+        };
+        let channels = UserDataChannels { order_rx, pos_rx };
+        (policy, channels)
     }
 }
 
@@ -164,11 +178,43 @@ impl WsPolicy for AsterUserDataPolicy {
                     .get_by_exchange_symbol(Exchange::Aster, &report.symbol, InstrumentType::Swap)
                     .and_then(|inst| aster_execution_to_order_event(&report, inst.key))
                 {
-                    if self.order_tx.send(event).await.is_err() {
-                        return Err(anyhow::anyhow!("Aster execution channel closed"));
+                    match self.order_tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("Aster order channel full — dropping event");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            debug!("Aster order channel closed");
+                        }
                     }
                 } else {
                     warn!(symbol = %report.symbol, "Aster execution for untracked symbol or parse failed");
+                }
+            }
+            Ok(AsterFuturesUserDataEvent::AccountUpdate { update }) => {
+                for ws_pos in &update.positions {
+                    if let Some(inst) = self.registry.get_by_exchange_symbol(
+                        Exchange::Aster,
+                        &ws_pos.symbol,
+                        InstrumentType::Swap,
+                    ) && let Some(patch) = ws_position_to_patch(ws_pos, inst.key)
+                    {
+                        debug!(
+                            key = %inst.key,
+                            size = %patch.size,
+                            entry = %patch.entry_price,
+                            "Aster ACCOUNT_UPDATE position"
+                        );
+                        match self.pos_tx.try_send(patch) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!("Aster position channel full — dropping patch");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("Aster position channel closed");
+                            }
+                        }
+                    }
                 }
             }
             Ok(AsterFuturesUserDataEvent::Other) => {}

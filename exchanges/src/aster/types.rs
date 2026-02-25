@@ -320,8 +320,38 @@ pub enum AsterFuturesUserDataEvent {
         #[serde(rename = "o")]
         order: Box<AsterFuturesOrderTradeUpdate>,
     },
+    #[serde(rename = "ACCOUNT_UPDATE")]
+    AccountUpdate {
+        #[serde(rename = "a")]
+        update: AsterFuturesAccountUpdate,
+    },
     #[serde(other)]
     Other,
+}
+
+/// Payload inside an `ACCOUNT_UPDATE` user-data event.
+#[derive(Debug, Deserialize)]
+pub struct AsterFuturesAccountUpdate {
+    /// Changed positions (only positions that changed are included).
+    #[serde(rename = "P")]
+    pub positions: Vec<AsterFuturesWsPosition>,
+}
+
+/// A single position entry inside an `ACCOUNT_UPDATE` event.
+#[derive(Debug, Deserialize)]
+pub struct AsterFuturesWsPosition {
+    /// Symbol, e.g. `"BTCUSDT"`.
+    #[serde(rename = "s")]
+    pub symbol: String,
+    /// Signed position amount (positive = long, negative = short, zero = closed).
+    #[serde(rename = "pa")]
+    pub position_amt: String,
+    /// Entry price.
+    #[serde(rename = "ep")]
+    pub entry_price: String,
+    /// Unrealized PnL.
+    #[serde(rename = "up")]
+    pub unrealized_profit: String,
 }
 
 /// Order execution report inside `ORDER_TRADE_UPDATE`.

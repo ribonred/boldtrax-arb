@@ -1,8 +1,12 @@
 use anyhow::Result;
 use boldtrax_core::config::types::{AppConfig, ExchangeConfig};
+use boldtrax_core::manager::types::WsPositionPatch;
 use boldtrax_core::registry::InstrumentRegistry;
-use boldtrax_core::traits::{FundingRateMarketData, MarketDataProvider, OrderBookFeeder};
-use boldtrax_core::types::{Exchange, InstrumentKey};
+use boldtrax_core::traits::{
+    FundingRateMarketData, MarketDataProvider, OrderBookFeeder, OrderExecutionProvider,
+    PositionProvider,
+};
+use boldtrax_core::types::{Exchange, InstrumentKey, OrderEvent};
 use chrono::Utc;
 use exchanges::aster::client::{AsterClient, AsterConfig};
 use exchanges::binance::{BinanceClient, BinanceConfig};
@@ -27,14 +31,20 @@ pub async fn run_probe(
             let client = BinanceClient::new(config, registry.clone())?;
             probe_client(&client, registry, instrument.clone()).await?;
             probe_account_client(&client).await?;
-            probe_position_client(&client, instrument).await?;
+            probe_position_client(&client, instrument.clone()).await?;
+            probe_open_orders(&client, instrument.clone()).await?;
+            probe_execution_stream(&client).await?;
+            probe_position_stream(&client).await?;
         }
         Exchange::Aster => {
             let config = AsterConfig::from_app_config(app_config)?;
             let client = AsterClient::new(config, registry.clone())?;
             probe_client(&client, registry, instrument.clone()).await?;
             probe_account_client(&client).await?;
-            probe_position_client(&client, instrument).await?;
+            probe_position_client(&client, instrument.clone()).await?;
+            probe_open_orders(&client, instrument.clone()).await?;
+            probe_execution_stream(&client).await?;
+            probe_position_stream(&client).await?;
         }
         _ => {
             println!("Probe not implemented for {:?}", exchange);
@@ -237,6 +247,128 @@ where
                 Err(e) => println!("   Failed to get leverage: {}", e),
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn probe_open_orders<C>(client: &C, instrument: Option<String>) -> Result<()>
+where
+    C: OrderExecutionProvider,
+{
+    let Some(inst_str) = instrument else {
+        println!("9. Skipping open orders (no --instrument).");
+        return Ok(());
+    };
+
+    let key = InstrumentKey::from_str(&inst_str).map_err(|e| anyhow::anyhow!(e))?;
+    println!("9.  Testing get_open_orders for {}...", key);
+    match client.get_open_orders(key).await {
+        Ok(orders) => {
+            println!("    Open orders: {} total", orders.len());
+            for order in &orders {
+                println!(
+                    "      {} {} {} | size: {} filled: {} | status: {:?} | id: {}",
+                    order.request.key,
+                    order.request.side,
+                    order.request.order_type,
+                    order.request.size,
+                    order.filled_size,
+                    order.status,
+                    order.client_order_id,
+                );
+            }
+        }
+        Err(e) => println!("    Failed to fetch open orders: {}", e),
+    }
+
+    Ok(())
+}
+
+async fn probe_execution_stream<C>(client: &C) -> Result<()>
+where
+    C: OrderExecutionProvider,
+{
+    println!("10. Testing execution stream (5 seconds)...");
+    let (tx, mut rx) = mpsc::channel::<OrderEvent>(64);
+
+    let stream_future = client.stream_executions(tx);
+
+    let receive_future = async {
+        let mut count = 0u32;
+        while let Some(event) = rx.recv().await {
+            count += 1;
+            let order = event.inner();
+            println!(
+                "    [exec #{count}] {} {:?} {} | filled: {} | status: {:?}",
+                order.request.key,
+                order.request.side,
+                order.request.order_type,
+                order.filled_size,
+                order.status,
+            );
+        }
+        count
+    };
+
+    println!("    Connecting...");
+    match timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            res = stream_future => {
+                if let Err(e) = res {
+                    println!("    Stream error: {}", e);
+                }
+                0u32
+            }
+            count = receive_future => count,
+        }
+    })
+    .await
+    {
+        Ok(count) => println!("    Stream ended early. Received {} events.", count),
+        Err(_) => println!("    Timed out after 5s (expected for idle stream)."),
+    }
+
+    Ok(())
+}
+
+async fn probe_position_stream<C>(client: &C) -> Result<()>
+where
+    C: PositionProvider,
+{
+    println!("11. Testing position stream (5 seconds)...");
+    let (tx, mut rx) = mpsc::channel::<WsPositionPatch>(64);
+
+    let stream_future = client.stream_position_updates(tx);
+
+    let receive_future = async {
+        let mut count = 0u32;
+        while let Some(patch) = rx.recv().await {
+            count += 1;
+            println!(
+                "    [pos #{count}] {} | size: {} | entry: {} | pnl: {}",
+                patch.key, patch.size, patch.entry_price, patch.unrealized_pnl,
+            );
+        }
+        count
+    };
+
+    println!("    Connecting...");
+    match timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            res = stream_future => {
+                if let Err(e) = res {
+                    println!("    Stream error: {}", e);
+                }
+                0u32
+            }
+            count = receive_future => count,
+        }
+    })
+    .await
+    {
+        Ok(count) => println!("    Stream ended early. Received {} patches.", count),
+        Err(_) => println!("    Timed out after 5s (expected for idle stream)."),
     }
 
     Ok(())

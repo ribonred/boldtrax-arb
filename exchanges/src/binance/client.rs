@@ -16,12 +16,12 @@ use boldtrax_core::types::{
     InstrumentType, Order, OrderBookSnapshot, OrderBookUpdate, OrderRequest, OrderSide, OrderType,
     Position,
 };
-use boldtrax_core::ws::{CancellationToken, ws_supervisor_spawn};
+use boldtrax_core::ws::{CancellationToken, WsSupervisorHandle, ws_supervisor_spawn};
 use boldtrax_core::{AccountSnapshot, Exchange, ExecutionMode, OrderEvent};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use tokio::sync::{OnceCell, mpsc};
-use tracing::{debug, info};
+use tokio::sync::{Mutex, OnceCell, mpsc};
+use tracing::{debug, info, warn};
 
 use crate::binance::codec::BinanceClientOrderIdCodec;
 use crate::binance::ws::{
@@ -43,6 +43,12 @@ use crate::binance::types::{
 
 use boldtrax_core::config::types::ExchangeConfig;
 use serde::Deserialize;
+
+struct FuturesUserDataHandle {
+    order_rx: Mutex<Option<mpsc::Receiver<OrderEvent>>>,
+    pos_rx: Mutex<Option<mpsc::Receiver<WsPositionPatch>>>,
+    _supervisor: WsSupervisorHandle,
+}
 
 const BINANCE_FUTURES_BASE_URL: &str = "https://fapi.binance.com";
 const BINANCE_SPOT_BASE_URL: &str = "https://api.binance.com";
@@ -153,6 +159,7 @@ pub struct BinanceClient {
     /// Used to populate the `leverage` field in positions fetched via REST
     /// (Binance v3 `positionRisk` does not return leverage).
     leverage_map: std::sync::RwLock<HashMap<InstrumentKey, rust_decimal::Decimal>>,
+    futures_user_data: OnceCell<FuturesUserDataHandle>,
 }
 
 impl BinanceClient {
@@ -252,7 +259,35 @@ impl BinanceClient {
             spot_private_client,
             instruments_loaded: OnceCell::new(),
             leverage_map: std::sync::RwLock::new(HashMap::new()),
+            futures_user_data: OnceCell::new(),
         })
+    }
+
+    async fn ensure_futures_user_data(&self) -> Result<&FuturesUserDataHandle, AccountError> {
+        self.futures_user_data
+            .get_or_try_init(|| async {
+                let client = self.futures_private_client()?.clone();
+                let base_ws_url = if self.config.testnet {
+                    BINANCE_FUTURES_WS_TESTNET_URL
+                } else {
+                    BINANCE_FUTURES_WS_BASE_URL
+                }
+                .to_string();
+
+                let (policy, channels) =
+                    BinanceFuturesUserDataPolicy::new(client, base_ws_url, self.registry.clone());
+
+                let cancel = CancellationToken::new();
+                let supervisor = ws_supervisor_spawn(policy, cancel);
+                info!("Binance Futures user-data supervisor spawned (shared)");
+
+                Ok(FuturesUserDataHandle {
+                    order_rx: Mutex::new(Some(channels.order_rx)),
+                    pos_rx: Mutex::new(Some(channels.pos_rx)),
+                    _supervisor: supervisor,
+                })
+            })
+            .await
     }
 
     async fn fetch_spot_balances(&self) -> Result<Vec<BinanceSpotBalance>, AccountError> {
@@ -791,7 +826,6 @@ impl OrderExecutionProvider for BinanceClient {
 
         let cancel = CancellationToken::new();
 
-        // Cancel all supervisors when the receiver side of the channel is dropped.
         let cancel_on_close = cancel.clone();
         let tx_watcher = tx.clone();
         tokio::spawn(async move {
@@ -799,7 +833,7 @@ impl OrderExecutionProvider for BinanceClient {
             cancel_on_close.cancel();
         });
 
-        let mut handles = Vec::new();
+        let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         if include_spot {
             let (api_key, api_secret) = {
@@ -820,32 +854,47 @@ impl OrderExecutionProvider for BinanceClient {
                 self.registry.clone(),
                 tx.clone(),
             );
-            handles.push(ws_supervisor_spawn(policy, cancel.clone()));
+            let spot_supervisor = ws_supervisor_spawn(policy, cancel.clone());
+            join_handles.push(tokio::spawn(async move { spot_supervisor.join().await }));
             info!("Binance Spot user-data supervisor spawned (WS API)");
         }
 
+        // Futures path: relay from the shared supervisor's order_rx.
         if include_futures {
-            let client = self.futures_private_client()?.clone();
-            let base_ws_url = if self.config.testnet {
-                BINANCE_FUTURES_WS_TESTNET_URL
-            } else {
-                BINANCE_FUTURES_WS_BASE_URL
-            }
-            .to_string();
+            let handle = self.ensure_futures_user_data().await?;
+            let mut order_rx = match handle.order_rx.lock().await.take() {
+                Some(rx) => rx,
+                None => {
+                    warn!("Futures order_rx already taken by a prior stream_executions call");
+                    std::future::pending::<()>().await;
+                    return Ok(());
+                }
+            };
 
-            let policy = BinanceFuturesUserDataPolicy::new(
-                client,
-                base_ws_url,
-                self.registry.clone(),
-                tx.clone(),
-            );
-            handles.push(ws_supervisor_spawn(policy, cancel.clone()));
-            info!("Binance Futures user-data supervisor spawned");
+            let tx_futures = tx.clone();
+            let relay_cancel = cancel.clone();
+            join_handles.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = relay_cancel.cancelled() => break,
+                        msg = order_rx.recv() => {
+                            match msg {
+                                Some(event) => {
+                                    if tx_futures.send(event).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            }));
+            info!("Binance Futures order relay started (shared supervisor)");
         }
 
-        // Block until all supervisors exit (triggered by cancellation or fatal error).
-        for handle in handles {
-            handle.join().await;
+        for handle in join_handles {
+            let _ = handle.await;
         }
 
         Ok(())
@@ -900,7 +949,7 @@ impl PositionProvider for BinanceClient {
 
     async fn stream_position_updates(
         &self,
-        tx: mpsc::Sender<WsPositionPatch>,
+        sender: mpsc::Sender<WsPositionPatch>,
     ) -> Result<(), AccountError> {
         if !matches!(
             self.config.mode,
@@ -910,24 +959,39 @@ impl PositionProvider for BinanceClient {
             return Ok(());
         }
 
-        let client = self.futures_private_client()?.clone();
-        let base_ws_url = if self.config.testnet {
-            BINANCE_FUTURES_WS_TESTNET_URL
-        } else {
-            BINANCE_FUTURES_WS_BASE_URL
-        }
-        .to_string();
-
-        let policy = BinanceFuturesUserDataPolicy::new_for_positions(
-            client,
-            base_ws_url,
-            self.registry.clone(),
-            tx,
-        );
+        let handle = self.ensure_futures_user_data().await?;
+        let mut pos_recv = match handle.pos_rx.lock().await.take() {
+            Some(rx) => rx,
+            None => {
+                warn!("Futures pos_rx already taken by a prior stream_position_updates call");
+                std::future::pending::<()>().await;
+                return Ok(());
+            }
+        };
 
         let cancel = CancellationToken::new();
-        let handle = ws_supervisor_spawn(policy, cancel);
-        handle.join().await;
+        let cancel_on_close = cancel.clone();
+        let sender_watcher = sender.clone();
+        tokio::spawn(async move {
+            sender_watcher.closed().await;
+            cancel_on_close.cancel();
+        });
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = pos_recv.recv() => {
+                    match msg {
+                        Some(patch) => {
+                            if sender.send(patch).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
