@@ -66,7 +66,7 @@ mod tests {
         let pair = SpotPerpPair::new(spot_key(), perp_key());
         let oracle = PriceOracle::new();
         // min funding threshold 0.001, max position 100, target notional 1.0, drift 10%
-        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("100"), dec("1.0"), dec("10"));
+        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("1.0"), dec("10"));
         let margin = MarginManager::new(dec("0.9"), dec("5.0"));
         let exec = StubExecution::new();
         ArbitrageEngine::new(pair, oracle, decider, margin, exec)
@@ -183,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn test_paper_engine_enter_cycle() {
         let pair = SpotPerpPair::new(spot_key(), perp_key());
-        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("100"), dec("1.0"), dec("10"));
+        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("1.0"), dec("10"));
         let margin = MarginManager::new(dec("0.9"), dec("5.0"));
         let paper = PaperExecution::new(StubExecution::new());
         let engine: ArbitrageEngine<

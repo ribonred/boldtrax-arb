@@ -115,3 +115,52 @@ impl ZmqEvent {
         }
     }
 }
+
+/// Commands sent from external clients (CLI, risk monitor) to a running strategy.
+/// Each strategy exposes its own ROUTER socket, discoverable via Redis.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum StrategyCommand {
+    /// Gradually close the position in chunks. The strategy enters
+    /// `Unwinding` status and does not accept new entries until
+    /// both legs are fully closed.
+    GracefulExit,
+    /// Immediately market-close both legs (emergency).
+    ForceExit,
+    /// Pause evaluation — the decider returns `DoNothing` while paused.
+    Pause,
+    /// Resume evaluation after a `Pause`.
+    Resume,
+    /// Request current strategy status (pair status, positions, etc.).
+    GetStatus,
+}
+
+/// Response from a strategy's ROUTER socket back to the command sender.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+#[repr(u8)]
+pub enum StrategyResponse {
+    /// Command accepted and will be acted upon.
+    Ack,
+    /// Command rejected with a reason (e.g. invalid state transition).
+    Rejected(String),
+    /// Strategy status snapshot.
+    Status(StrategyStatus),
+    /// An error occurred while processing the command.
+    Error(String),
+}
+
+/// Lightweight status snapshot returned by `GetStatus`.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct StrategyStatus {
+    /// Strategy identity (e.g. "spot_perp_btc_binance").
+    pub strategy_id: String,
+    /// Current pair lifecycle status as a string (e.g. "Active", "Unwinding").
+    pub pair_status: String,
+    /// Whether evaluation is paused.
+    pub paused: bool,
+    /// Number of tracked orders still in flight.
+    pub pending_orders: usize,
+}

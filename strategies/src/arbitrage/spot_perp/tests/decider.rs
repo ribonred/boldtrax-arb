@@ -28,8 +28,7 @@ mod tests {
 
     #[test]
     fn test_decider_enter_position() {
-        let decider =
-            SpotRebalanceDecider::new(dec("0.001"), dec("0.0005"), dec("100.0"), dec("10"));
+        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("100.0"), dec("10"));
         let mut pair = create_test_pair();
 
         // Perp funding rate exceeds threshold — should enter.
@@ -44,8 +43,7 @@ mod tests {
 
     #[test]
     fn test_decider_exit_position() {
-        let decider =
-            SpotRebalanceDecider::new(dec("0.001"), dec("0.0005"), dec("100.0"), dec("10"));
+        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("100.0"), dec("10"));
         let mut pair = create_test_pair();
 
         // Perp funding turned negative — should exit.
@@ -62,8 +60,7 @@ mod tests {
 
     #[test]
     fn test_decider_rebalance_delta() {
-        let decider =
-            SpotRebalanceDecider::new(dec("0.001"), dec("0.0005"), dec("100.0"), dec("10"));
+        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("100.0"), dec("10"));
         let mut pair = create_test_pair();
 
         // Perp funding still positive.
@@ -82,8 +79,7 @@ mod tests {
 
     #[test]
     fn test_decider_hold() {
-        let decider =
-            SpotRebalanceDecider::new(dec("0.001"), dec("0.0005"), dec("100.0"), dec("10"));
+        let decider = SpotRebalanceDecider::new(dec("0.001"), dec("100.0"), dec("10"));
         let mut pair = create_test_pair();
 
         // Perp funding below threshold — should do nothing.

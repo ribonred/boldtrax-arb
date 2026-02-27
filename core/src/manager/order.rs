@@ -194,14 +194,6 @@ where
             return Err(TradingError::InvalidPostOnly);
         }
 
-        // Max single-order size in base asset units
-        if req.size > self.fat_finger.max_order_size {
-            return Err(TradingError::MaxOrderSizeExceeded {
-                requested: req.size,
-                max: self.fat_finger.max_order_size,
-            });
-        }
-
         // Max order notional: use limit price when available, otherwise require a live mid
         let notional = if let Some(price) = req.price {
             price * req.size

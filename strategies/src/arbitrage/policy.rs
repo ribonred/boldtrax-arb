@@ -6,6 +6,8 @@ use thiserror::Error;
 
 use crate::arbitrage::types::{DeciderAction, PairState};
 
+use boldtrax_core::types::Exchange;
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -226,6 +228,21 @@ pub trait ExecutionPolicy<P: PairState>: Send + Sync {
         action: &DeciderAction,
         pair: &mut P,
     ) -> Result<(), ExecutionError>;
+
+    /// Cancel an order on the exchange by its client order ID.
+    ///
+    /// Used by the stale-order cancellation logic. The default returns
+    /// an error; concrete engines override with their router.
+    async fn cancel_order(
+        &mut self,
+        _exchange: Exchange,
+        _order_id: String,
+    ) -> Result<(), ExecutionError> {
+        Err(ExecutionError::OrderFailed {
+            key: "cancel".into(),
+            reason: "cancel_order not implemented for this execution policy".into(),
+        })
+    }
 
     /// Template method: logs the action, delegates to `execute_inner`, and
     /// records outcome metrics. Do NOT override unless replacing the logging

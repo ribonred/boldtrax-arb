@@ -69,6 +69,22 @@ impl ExecutionPolicy<SpotPerpPair> for StubExecution {
                 self.actions.push("exit".to_string());
                 pair.status = PairStatus::Inactive;
             }
+            DeciderAction::Recover {
+                size_long,
+                size_short,
+            } => {
+                self.actions
+                    .push(format!("recover long={size_long} short={size_short}"));
+                pair.status = PairStatus::Active;
+            }
+            DeciderAction::Unwind {
+                size_long,
+                size_short,
+            } => {
+                self.actions
+                    .push(format!("unwind long={size_long} short={size_short}"));
+                pair.status = PairStatus::Inactive;
+            }
             DeciderAction::DoNothing => {
                 self.actions.push("noop".to_string());
             }

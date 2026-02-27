@@ -239,8 +239,8 @@ pub fn apply_bybit_hmac_auth(
 /// Exposed so exchange-level tests can independently verify signatures
 /// without pulling in `hmac` / `sha2` / `hex` directly.
 pub fn hmac_sha256_hex(secret: &[u8], data: &[u8]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     hex::encode(mac.finalize().into_bytes())
 }

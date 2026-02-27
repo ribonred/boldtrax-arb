@@ -1,5 +1,7 @@
 use boldtrax_core::zmq::client::ZmqEventSubscriber;
+use boldtrax_core::zmq::protocol::StrategyCommand;
 use strum::{Display, EnumString};
+use tokio::sync::mpsc;
 
 use crate::arbitrage::engine::ArbitrageEngine;
 use crate::arbitrage::margin::MarginManager;
@@ -42,22 +44,31 @@ pub type PerpPerpLivePoller = PerpPerpPoller<MarginManager, PriceOracle>;
 // This is handled at construction time in strategy.rs.
 
 pub enum StrategyRunner {
-    SpotPerp(SpotPerpEngine, ZmqEventSubscriber),
-    SpotPerpPaper(SpotPerpPaperEngine, ZmqEventSubscriber),
+    SpotPerp(
+        SpotPerpEngine,
+        ZmqEventSubscriber,
+        mpsc::Receiver<StrategyCommand>,
+    ),
+    SpotPerpPaper(
+        SpotPerpPaperEngine,
+        ZmqEventSubscriber,
+        mpsc::Receiver<StrategyCommand>,
+    ),
     PerpPerp(
         Box<PerpPerpLivePoller>,
         ZmqEventSubscriber,
         ZmqEventSubscriber,
+        mpsc::Receiver<StrategyCommand>,
     ),
 }
 
 impl StrategyRunner {
     pub async fn run(self) {
         match self {
-            StrategyRunner::SpotPerp(engine, sub) => engine.run(sub).await,
-            StrategyRunner::SpotPerpPaper(engine, sub) => engine.run(sub).await,
-            StrategyRunner::PerpPerp(poller, long_sub, short_sub) => {
-                poller.run(long_sub, short_sub).await;
+            StrategyRunner::SpotPerp(engine, sub, cmd_rx) => engine.run(sub, cmd_rx).await,
+            StrategyRunner::SpotPerpPaper(engine, sub, cmd_rx) => engine.run(sub, cmd_rx).await,
+            StrategyRunner::PerpPerp(poller, long_sub, short_sub, cmd_rx) => {
+                poller.run(long_sub, short_sub, cmd_rx).await;
             }
         }
     }

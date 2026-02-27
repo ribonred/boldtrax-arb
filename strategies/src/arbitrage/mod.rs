@@ -3,6 +3,7 @@ pub mod margin;
 pub mod oracle;
 pub mod paper;
 pub mod policy;
+pub mod recovery;
 pub mod runner;
 pub mod types;
 

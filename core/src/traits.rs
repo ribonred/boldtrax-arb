@@ -221,8 +221,6 @@ pub enum TradingError {
     InvalidExecutionMode,
     #[error("minimum notional violated: requested {requested}, minimum {min}")]
     MinNotionalViolated { requested: Decimal, min: Decimal },
-    #[error("order size {requested} exceeds maximum allowed {max}")]
-    MaxOrderSizeExceeded { requested: Decimal, max: Decimal },
     #[error("order notional {requested} exceeds maximum allowed {max}")]
     MaxNotionalExceeded { requested: Decimal, max: Decimal },
     #[error("limit price deviates {deviation_pct}% from market price, exceeds max {max_pct}%")]

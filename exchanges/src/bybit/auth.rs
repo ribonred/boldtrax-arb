@@ -68,9 +68,18 @@ mod tests {
             .expect("apply_auth should not fail");
 
         let headers = request.headers();
-        assert!(headers.get("x-bapi-api-key").is_some(), "x-bapi-api-key missing");
-        assert!(headers.get("x-bapi-timestamp").is_some(), "x-bapi-timestamp missing");
-        assert!(headers.get("x-bapi-recv-window").is_some(), "x-bapi-recv-window missing");
+        assert!(
+            headers.get("x-bapi-api-key").is_some(),
+            "x-bapi-api-key missing"
+        );
+        assert!(
+            headers.get("x-bapi-timestamp").is_some(),
+            "x-bapi-timestamp missing"
+        );
+        assert!(
+            headers.get("x-bapi-recv-window").is_some(),
+            "x-bapi-recv-window missing"
+        );
         assert!(headers.get("x-bapi-sign").is_some(), "x-bapi-sign missing");
 
         assert_eq!(
@@ -139,8 +148,8 @@ mod tests {
         let url = Url::parse("https://api.bybit.com/v5/position/list?category=linear").unwrap();
         let mut request = Client::new().get(url).build().unwrap();
 
-        let auth = BybitHmacAuth::new("key".to_string(), "secret".to_string())
-            .with_recv_window_ms(10_000);
+        let auth =
+            BybitHmacAuth::new("key".to_string(), "secret".to_string()).with_recv_window_ms(10_000);
         auth.apply_auth(&mut request).await.unwrap();
 
         assert_eq!(

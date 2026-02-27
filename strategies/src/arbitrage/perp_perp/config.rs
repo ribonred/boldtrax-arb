@@ -24,8 +24,6 @@ pub struct PerpPerpStrategyConfig {
     pub exit_threshold: Option<Decimal>,
     /// Target dollar exposure per side.
     pub target_notional: Decimal,
-    /// Maximum position size per symbol (USD).
-    pub max_position_size: Decimal,
     /// Delta drift threshold to trigger rebalance (% of target_notional).
     pub rebalance_drift_pct: Decimal,
     /// Minimum distance from liquidation price as % of mark price.
@@ -73,10 +71,6 @@ impl PerpPerpStrategyConfig {
         assert!(
             self.target_notional > Decimal::ZERO,
             "strategy.perp_perp.target_notional must be > 0"
-        );
-        assert!(
-            self.max_position_size > Decimal::ZERO,
-            "strategy.perp_perp.max_position_size must be > 0"
         );
         assert!(
             self.rebalance_drift_pct > Decimal::ZERO,
@@ -136,7 +130,6 @@ impl PerpPerpStrategyConfig {
         PerpPerpDecider::new(
             self.min_spread_threshold,
             self.exit_threshold,
-            self.max_position_size,
             self.target_notional,
             self.rebalance_drift_pct,
         )
@@ -157,7 +150,6 @@ mod tests {
             carry_direction = "positive"
             min_spread_threshold = "0.0002"
             target_notional = "500"
-            max_position_size = "600"
             rebalance_drift_pct = "10"
             liquidation_buffer_pct = "15"
             perp_long_instrument = "XRPUSDT-BN-SWAP"
@@ -178,7 +170,6 @@ mod tests {
         assert_eq!(cfg.carry_direction, CarryDirection::Positive);
         assert_eq!(cfg.min_spread_threshold, dec!(0.0002));
         assert_eq!(cfg.target_notional, dec!(500));
-        assert_eq!(cfg.max_position_size, dec!(600));
         assert_eq!(cfg.rebalance_drift_pct, dec!(10));
         assert_eq!(cfg.liquidation_buffer_pct, dec!(15));
         assert_eq!(cfg.poll_interval_secs, 30);
@@ -193,7 +184,6 @@ mod tests {
             min_spread_threshold = "0.0003"
             exit_threshold = "-0.0001"
             target_notional = "200"
-            max_position_size = "300"
             rebalance_drift_pct = "5"
             liquidation_buffer_pct = "10"
             perp_long_instrument = "BTCUSDT-BN-SWAP"
@@ -217,7 +207,6 @@ mod tests {
         let cfg = PerpPerpStrategyConfig::from_strategy_map(&map);
         let decider = cfg.build_decider();
         assert_eq!(decider.min_spread_threshold, dec!(0.0002));
-        assert_eq!(decider.max_position_size, dec!(600));
         assert_eq!(decider.target_notional, dec!(500));
         assert_eq!(decider.rebalance_drift_pct, dec!(10));
         assert!(decider.exit_threshold.is_none());
@@ -254,7 +243,6 @@ mod tests {
             carry_direction = "positive"
             min_spread_threshold = "0"
             target_notional = "500"
-            max_position_size = "600"
             rebalance_drift_pct = "10"
             liquidation_buffer_pct = "15"
             perp_long_instrument = "XRPUSDT-BN-SWAP"

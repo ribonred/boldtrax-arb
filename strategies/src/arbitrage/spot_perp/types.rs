@@ -2,7 +2,7 @@ use boldtrax_core::types::{InstrumentKey, InstrumentType, OrderEvent, OrderSide,
 use boldtrax_core::zmq::protocol::ZmqEvent;
 use rust_decimal::Decimal;
 
-use crate::arbitrage::types::{PairState, PairStatus, PerpLeg};
+use crate::arbitrage::types::{OrderTracker, PairState, PairStatus, PerpLeg};
 
 #[derive(Debug, Clone)]
 pub struct SpotLeg {
@@ -42,6 +42,25 @@ impl SpotLeg {
     pub fn notional(&self) -> Decimal {
         self.quantity * self.current_price
     }
+
+    /// Check if available depth can absorb `size`.
+    ///
+    /// Positive `size` checks ask depth (buying); negative checks bid depth (selling).
+    /// Returns `true` if depth >= |size| **or** if depth is unknown.
+    pub fn depth_sufficient(&self, size: Decimal) -> bool {
+        if size.is_zero() {
+            return true;
+        }
+        let depth = if size.is_sign_positive() {
+            self.ask_depth
+        } else {
+            self.bid_depth
+        };
+        match depth {
+            Some(d) => d >= size.abs(),
+            None => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +78,8 @@ pub struct SpotPerpPair {
     /// Tracks cumulative signed fill for the current spot order's partial fills.
     /// Reset to zero when the order reaches Filled state.
     last_spot_partial_fill: Decimal,
+    /// In-flight order tracker for both legs.
+    pub order_tracker: OrderTracker,
 }
 
 impl SpotPerpPair {
@@ -70,6 +91,7 @@ impl SpotPerpPair {
             status: PairStatus::Inactive,
             perp_position: None,
             last_spot_partial_fill: Decimal::ZERO,
+            order_tracker: OrderTracker::new(),
         }
     }
 
@@ -95,6 +117,14 @@ impl PairState for SpotPerpPair {
 
     fn leg_keys(&self) -> Vec<InstrumentKey> {
         vec![self.spot.key, self.perp.key]
+    }
+
+    fn order_tracker(&self) -> &OrderTracker {
+        &self.order_tracker
+    }
+
+    fn order_tracker_mut(&mut self) -> &mut OrderTracker {
+        &mut self.order_tracker
     }
 
     #[tracing::instrument(name = "SpotPerpPair::apply_event", skip(self), fields(event = ?event))]
@@ -127,8 +157,8 @@ impl PairState for SpotPerpPair {
                     self.perp.position_size,
                     self.perp.entry_price
                 );
-                // Auto-transition to Active when both legs are filled.
-                if self.status == PairStatus::Inactive
+                // Auto-transition: Inactive/Entering → Active when both legs filled.
+                if matches!(self.status, PairStatus::Inactive | PairStatus::Entering)
                     && !self.perp.position_size.is_zero()
                     && !self.spot.quantity.is_zero()
                 {
@@ -166,8 +196,8 @@ impl PairState for SpotPerpPair {
                                 signed_fill,
                                 self.spot.quantity
                             );
-                            // Auto-transition to Active when both legs are filled.
-                            if self.status == PairStatus::Inactive
+                            // Auto-transition: Inactive/Entering → Active when both legs filled.
+                            if matches!(self.status, PairStatus::Inactive | PairStatus::Entering)
                                 && !self.perp.position_size.is_zero()
                                 && !self.spot.quantity.is_zero()
                             {
@@ -233,5 +263,52 @@ impl PairState for SpotPerpPair {
             Some(pos) => vec![(pos, self.perp.current_price)],
             None => vec![],
         }
+    }
+
+    fn is_fully_entered(&self) -> bool {
+        !self.spot.quantity.is_zero() && !self.perp.position_size.is_zero()
+    }
+
+    fn is_fully_exited(&self) -> bool {
+        self.spot.quantity.is_zero() && self.perp.position_size.is_zero()
+    }
+
+    fn close_sizes(&self) -> (Decimal, Decimal) {
+        (-self.spot.quantity, -self.perp.position_size)
+    }
+
+    fn has_sufficient_depth(&self, size_long: Decimal, size_short: Decimal) -> bool {
+        self.spot.depth_sufficient(size_long) && self.perp.depth_sufficient(size_short)
+    }
+
+    fn recovery_sizes(&self) -> Option<(Decimal, Decimal)> {
+        let spot_has = !self.spot.quantity.is_zero();
+        let perp_has = !self.perp.position_size.is_zero();
+
+        if spot_has == perp_has {
+            return None;
+        }
+
+        let spot_price = self.spot.best_ask.unwrap_or(self.spot.current_price);
+        let perp_price = self.perp.best_ask.unwrap_or(self.perp.current_price);
+
+        if (!spot_has && spot_price.is_zero()) || (!perp_has && perp_price.is_zero()) {
+            return None;
+        }
+
+        let size_long = if spot_has {
+            Decimal::ZERO
+        } else {
+            let target = self.perp.position_size.abs() * perp_price;
+            target / spot_price
+        };
+        let size_short = if perp_has {
+            Decimal::ZERO
+        } else {
+            let target = self.spot.quantity.abs() * spot_price;
+            -(target / perp_price)
+        };
+
+        Some((size_long, size_short))
     }
 }

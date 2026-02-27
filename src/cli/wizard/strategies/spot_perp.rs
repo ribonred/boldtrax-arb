@@ -56,11 +56,6 @@ impl StrategyWizard for SpotPerpWizard {
         let target_notional =
             prompt_decimal("Target dollar exposure per side (USD):", Decimal::from(280))?;
 
-        let max_position_size = prompt_decimal(
-            "Maximum position size per symbol (USD):",
-            Decimal::from(300),
-        )?;
-
         let rebalance_drift_pct = prompt_decimal(
             "Rebalance drift threshold (% of target notional):",
             Decimal::from(10),
@@ -77,10 +72,6 @@ impl StrategyWizard for SpotPerpWizard {
         map.insert(
             "target_notional".to_string(),
             toml::Value::String(target_notional.to_string()),
-        );
-        map.insert(
-            "max_position_size".to_string(),
-            toml::Value::String(max_position_size.to_string()),
         );
         map.insert(
             "rebalance_drift_pct".to_string(),

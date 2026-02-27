@@ -4,6 +4,8 @@ use std::marker::PhantomData;
 use crate::arbitrage::policy::{ExecutionError, ExecutionPolicy};
 use crate::arbitrage::types::{DeciderAction, PairState, PairStatus};
 
+use boldtrax_core::types::Exchange;
+
 /// Paper-trading decorator for any [`ExecutionPolicy`].
 ///
 /// Wraps a real execution engine and intercepts all orders, logging simulated
@@ -39,6 +41,20 @@ where
 {
     fn name(&self) -> &'static str {
         "paper_execution"
+    }
+
+    async fn cancel_order(
+        &mut self,
+        exchange: Exchange,
+        order_id: String,
+    ) -> Result<(), ExecutionError> {
+        tracing::info!(
+            mode = "paper",
+            %exchange,
+            %order_id,
+            "PAPER: simulated cancel"
+        );
+        Ok(())
     }
 
     async fn execute_inner(
@@ -83,6 +99,35 @@ where
                     monotonic_counter.paper_orders_simulated = 2,
                     "PAPER: simulated Exit fill"
                 );
+                pair.set_status(PairStatus::Inactive);
+            }
+            DeciderAction::Recover {
+                size_long,
+                size_short,
+            } => {
+                tracing::info!(
+                    mode = "paper",
+                    legs = ?keys,
+                    size_long = %size_long,
+                    size_short = %size_short,
+                    monotonic_counter.paper_orders_simulated = 1,
+                    "PAPER: simulated Recover fill"
+                );
+                pair.set_status(PairStatus::Active);
+            }
+            DeciderAction::Unwind {
+                size_long,
+                size_short,
+            } => {
+                tracing::info!(
+                    mode = "paper",
+                    legs = ?keys,
+                    size_long = %size_long,
+                    size_short = %size_short,
+                    monotonic_counter.paper_orders_simulated = 2,
+                    "PAPER: simulated Unwind chunk"
+                );
+                // In paper mode, assume the chunk fully closes the position.
                 pair.set_status(PairStatus::Inactive);
             }
             DeciderAction::DoNothing => {}

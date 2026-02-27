@@ -6,7 +6,7 @@ use boldtrax_core::zmq::protocol::ZmqEvent;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::arbitrage::types::{PairState, PairStatus, PerpLeg};
+use crate::arbitrage::types::{OrderTracker, PairState, PairStatus, PerpLeg};
 
 /// (`Positive` — most common) or paying funding (`Negative` — rare,
 /// useful for hedging or when funding is inverted).
@@ -75,6 +75,8 @@ pub struct PerpPerpPair {
     pub position_short: Option<Position>,
     /// In-memory funding rate cache.
     pub funding_cache: FundingCache,
+    /// In-flight order tracker for both legs.
+    pub order_tracker: OrderTracker,
 }
 
 impl PerpPerpPair {
@@ -93,6 +95,7 @@ impl PerpPerpPair {
             position_long: None,
             position_short: None,
             funding_cache: FundingCache::new(cache_staleness),
+            order_tracker: OrderTracker::new(),
         }
     }
 
@@ -170,7 +173,7 @@ impl PerpPerpPair {
     }
 
     pub fn maybe_transition_to_active(&mut self) {
-        if self.status == PairStatus::Inactive
+        if matches!(self.status, PairStatus::Inactive | PairStatus::Entering)
             && !self.long_leg.position_size.is_zero()
             && !self.short_leg.position_size.is_zero()
         {
@@ -199,6 +202,14 @@ impl PairState for PerpPerpPair {
 
     fn leg_keys(&self) -> Vec<InstrumentKey> {
         vec![self.long_leg.key, self.short_leg.key]
+    }
+
+    fn order_tracker(&self) -> &OrderTracker {
+        &self.order_tracker
+    }
+
+    fn order_tracker_mut(&mut self) -> &mut OrderTracker {
+        &mut self.order_tracker
     }
 
     /// Process ZMQ events that arrive via the event stream.
@@ -266,5 +277,58 @@ impl PairState for PerpPerpPair {
             checks.push((pos, self.short_leg.current_price));
         }
         checks
+    }
+
+    fn is_fully_entered(&self) -> bool {
+        !self.long_leg.position_size.is_zero() && !self.short_leg.position_size.is_zero()
+    }
+
+    fn is_fully_exited(&self) -> bool {
+        self.long_leg.position_size.is_zero() && self.short_leg.position_size.is_zero()
+    }
+
+    fn close_sizes(&self) -> (Decimal, Decimal) {
+        (-self.long_leg.position_size, -self.short_leg.position_size)
+    }
+
+    fn has_sufficient_depth(&self, size_long: Decimal, size_short: Decimal) -> bool {
+        self.long_leg.depth_sufficient(size_long) && self.short_leg.depth_sufficient(size_short)
+    }
+
+    fn recovery_sizes(&self) -> Option<(Decimal, Decimal)> {
+        let long_has_pos = !self.long_leg.position_size.is_zero();
+        let short_has_pos = !self.short_leg.position_size.is_zero();
+
+        if long_has_pos == short_has_pos {
+            return None; // Both present or both empty — nothing to recover.
+        }
+
+        let long_price = self
+            .long_leg
+            .best_bid
+            .unwrap_or(self.long_leg.current_price);
+        let short_price = self
+            .short_leg
+            .best_ask
+            .unwrap_or(self.short_leg.current_price);
+
+        if (!long_has_pos && long_price.is_zero()) || (!short_has_pos && short_price.is_zero()) {
+            return None; // Missing leg price not available yet.
+        }
+
+        let size_long = if long_has_pos {
+            Decimal::ZERO
+        } else {
+            let target = self.short_leg.position_size.abs() * short_price;
+            target / long_price
+        };
+        let size_short = if short_has_pos {
+            Decimal::ZERO
+        } else {
+            let target = self.long_leg.position_size.abs() * long_price;
+            -(target / short_price)
+        };
+
+        Some((size_long, size_short))
     }
 }

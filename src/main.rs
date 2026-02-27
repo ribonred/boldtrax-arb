@@ -50,6 +50,45 @@ enum Commands {
     Wizard,
     /// Check configuration health
     Doctor,
+    /// Control running strategies (list, status, pause, resume, exit)
+    #[command(alias = "ctl")]
+    Stratctl {
+        #[command(subcommand)]
+        action: StratctlSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum StratctlSubcommand {
+    /// List all running strategies
+    List,
+    /// Get current status of a strategy
+    Status {
+        /// Strategy ID (auto-selected if only one is running)
+        #[arg(short, long)]
+        strategy: Option<String>,
+    },
+    /// Pause strategy evaluation
+    Pause {
+        /// Strategy ID (auto-selected if only one is running)
+        #[arg(short, long)]
+        strategy: Option<String>,
+    },
+    /// Resume strategy evaluation
+    Resume {
+        /// Strategy ID (auto-selected if only one is running)
+        #[arg(short, long)]
+        strategy: Option<String>,
+    },
+    /// Gracefully unwind positions (chunked close)
+    Exit {
+        /// Strategy ID (auto-selected if only one is running)
+        #[arg(short, long)]
+        strategy: Option<String>,
+        /// Force immediate market-close instead of gradual unwind
+        #[arg(short, long, default_value = "false")]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -103,6 +142,28 @@ async fn main() -> anyhow::Result<()> {
                 RunMode::Strategy => run_strategy(&app_config).await?,
                 RunMode::All => run_all(&app_config).await?,
             }
+        }
+        Commands::Stratctl { action } => {
+            let app_config = load_and_validate_config();
+            let strategy_action = match action {
+                StratctlSubcommand::List => cli::stratctl::StrategyAction::List,
+                StratctlSubcommand::Status { strategy } => cli::stratctl::StrategyAction::Status {
+                    strategy_id: strategy,
+                },
+                StratctlSubcommand::Pause { strategy } => cli::stratctl::StrategyAction::Pause {
+                    strategy_id: strategy,
+                },
+                StratctlSubcommand::Resume { strategy } => cli::stratctl::StrategyAction::Resume {
+                    strategy_id: strategy,
+                },
+                StratctlSubcommand::Exit { strategy, force } => {
+                    cli::stratctl::StrategyAction::Exit {
+                        strategy_id: strategy,
+                        force,
+                    }
+                }
+            };
+            cli::stratctl::run_stratctl(&app_config, strategy_action).await?;
         }
     }
 

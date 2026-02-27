@@ -137,4 +137,120 @@ impl DiscoveryClient {
         let endpoint: Option<String> = conn.get(&key).await?;
         Ok(endpoint)
     }
+
+    // -------------------------------------------------------------------
+    // Strategy-level discovery (keyed by strategy_id, not Exchange)
+    // -------------------------------------------------------------------
+
+    fn build_strategy_key(strategy_id: &str) -> String {
+        format!("discovery:strategy:{}:router", strategy_id)
+    }
+
+    /// Register a strategy command endpoint and keep it alive with heartbeats.
+    pub async fn register_strategy(
+        &self,
+        strategy_id: &str,
+        endpoint: String,
+        ttl_secs: u64,
+    ) -> anyhow::Result<()> {
+        let key = Self::build_strategy_key(strategy_id);
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to get Redis connection for strategy discovery ({}): {}",
+                    key,
+                    e
+                )
+            })?;
+
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg(&endpoint)
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to register strategy in Redis ({}): {}", key, e)
+            })?;
+        info!(key = %key, endpoint = %endpoint, "Registered strategy command endpoint in Redis");
+
+        // Spawn heartbeat
+        let client_clone = self.client.clone();
+        let endpoint_clone = endpoint;
+        let heartbeat_interval = Duration::from_secs(ttl_secs / 3);
+
+        tokio::spawn(async move {
+            let mut interval = time::interval(heartbeat_interval);
+            loop {
+                interval.tick().await;
+                match client_clone.get_multiplexed_async_connection().await {
+                    Ok(mut hb_conn) => {
+                        let res: Result<(), redis::RedisError> = redis::cmd("SET")
+                            .arg(&key)
+                            .arg(&endpoint_clone)
+                            .arg("EX")
+                            .arg(ttl_secs)
+                            .query_async(&mut hb_conn)
+                            .await;
+                        if let Err(e) = res {
+                            error!(key = %key, error = %e, "Strategy heartbeat failed");
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to get Redis connection for strategy heartbeat");
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Discover a strategy's command endpoint by its ID.
+    pub async fn discover_strategy(
+        &self,
+        strategy_id: &str,
+    ) -> Result<Option<String>, redis::RedisError> {
+        let key = Self::build_strategy_key(strategy_id);
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let endpoint: Option<String> = conn.get(&key).await?;
+        Ok(endpoint)
+    }
+
+    /// Deregister a strategy command endpoint.
+    pub async fn deregister_strategy(&self, strategy_id: &str) -> Result<(), redis::RedisError> {
+        let key = Self::build_strategy_key(strategy_id);
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let _: () = conn.del(&key).await?;
+        debug!(key = %key, "Deregistered strategy from Redis");
+        Ok(())
+    }
+
+    /// List all currently registered strategy IDs.
+    ///
+    /// Uses `SCAN` to find all `discovery:strategy:*:router` keys and
+    /// extracts the strategy ID from each key.
+    pub async fn list_strategies(&self) -> Result<Vec<String>, redis::RedisError> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg("discovery:strategy:*:router")
+            .query_async(&mut conn)
+            .await?;
+
+        let prefix = "discovery:strategy:";
+        let suffix = ":router";
+        let ids = keys
+            .into_iter()
+            .filter_map(|k| {
+                k.strip_prefix(prefix)
+                    .and_then(|rest| rest.strip_suffix(suffix))
+                    .map(|id| id.to_string())
+            })
+            .collect();
+        Ok(ids)
+    }
 }

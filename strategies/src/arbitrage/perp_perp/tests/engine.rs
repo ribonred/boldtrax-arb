@@ -63,8 +63,8 @@ mod tests {
             Duration::from_secs(60),
         );
         let oracle = PriceOracle::new();
-        // min_spread=0.0002, exit_threshold=None, max_pos=1000, target=100, drift=10%
-        let decider = PerpPerpDecider::new(dec("0.0002"), None, dec("1000"), dec("100"), dec("10"));
+        // min_spread=0.0002, exit_threshold=None, target=100, drift=10%
+        let decider = PerpPerpDecider::new(dec("0.0002"), None, dec("100"), dec("10"));
         let margin = MarginManager::new(dec("5.0"), dec("15.0"));
         let exec = StubExecution::new();
         ArbitrageEngine::new(pair, oracle, decider, margin, exec)
@@ -216,7 +216,7 @@ mod tests {
             CarryDirection::Positive,
             Duration::from_secs(60),
         );
-        let decider = PerpPerpDecider::new(dec("0.0002"), None, dec("1000"), dec("100"), dec("10"));
+        let decider = PerpPerpDecider::new(dec("0.0002"), None, dec("100"), dec("10"));
         let margin = MarginManager::new(dec("5.0"), dec("15.0"));
         let paper = PaperExecution::new(StubExecution::new());
         let engine: ArbitrageEngine<

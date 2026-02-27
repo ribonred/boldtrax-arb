@@ -48,7 +48,6 @@ mod tests {
         PerpPerpDecider::new(
             dec("0.0002"), // min_spread_threshold
             None,          // exit_threshold: None → exit on sign flip
-            dec("1000"),   // max_position_size
             dec("100"),    // target_notional
             dec("10"),     // rebalance_drift_pct
         )
@@ -118,13 +117,8 @@ mod tests {
         pair.short_leg.position_size = dec("-40");
 
         // exit_threshold = 0.00005 → spread=0.0001 ≥ 0.00005 → hold
-        let decider = PerpPerpDecider::new(
-            dec("0.0002"),
-            Some(dec("0.00005")),
-            dec("1000"),
-            dec("100"),
-            dec("10"),
-        );
+        let decider =
+            PerpPerpDecider::new(dec("0.0002"), Some(dec("0.00005")), dec("100"), dec("10"));
         let action = decider.evaluate_inner_impl(&pair);
         assert!(matches!(action, DeciderAction::DoNothing));
 
@@ -185,13 +179,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Orphan guard: Inactive but positions exist → DoNothing
+    // Orphan recovery: Inactive with one leg filled → Enter missing leg
     // -----------------------------------------------------------------------
     #[test]
-    fn test_orphan_guard() {
+    fn test_orphan_recovery() {
         let mut pair = make_pair("0.0005", "0.0001");
-        pair.long_leg.position_size = dec("10"); // orphaned
+        pair.long_leg.position_size = dec("10"); // long filled, short missing
         // status is Inactive
+
+        let decider = make_decider();
+        let action = decider.evaluate_inner_impl(&pair);
+
+        // Should retry the missing short leg, matching the long leg's notional
+        // long notional = |10| * 2.5 = 25, short_qty = -(25 / 2.5) = -10
+        match action {
+            DeciderAction::Enter {
+                size_long,
+                size_short,
+            } => {
+                assert_eq!(size_long, dec("0")); // already filled
+                assert_eq!(size_short, dec("-10")); // recovery
+            }
+            other => panic!("Expected recovery Enter, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Both legs filled while Inactive → DoNothing (wait for Active transition)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_both_legs_inactive_waits() {
+        let mut pair = make_pair("0.0005", "0.0001");
+        pair.long_leg.position_size = dec("40");
+        pair.short_leg.position_size = dec("-40");
+        // status is Inactive — both filled, waiting for transition
 
         let decider = make_decider();
         let action = decider.evaluate_inner_impl(&pair);

@@ -7,7 +7,6 @@ use tracing::{debug, info, warn};
 pub struct SpotRebalanceDecider {
     /// Minimum perp funding rate to justify entering (e.g. 0.001 = 0.1%).
     pub min_funding_threshold: Decimal,
-    pub max_position_size: Decimal,
     pub target_notional: Decimal,
     /// Delta drift threshold as a percentage of `target_notional`.
     /// E.g. 10 = trigger rebalance when delta exceeds 10% of target.
@@ -17,13 +16,11 @@ pub struct SpotRebalanceDecider {
 impl SpotRebalanceDecider {
     pub fn new(
         min_funding_threshold: Decimal,
-        max_position_size: Decimal,
         target_notional: Decimal,
         rebalance_drift_pct: Decimal,
     ) -> Self {
         Self {
             min_funding_threshold,
-            max_position_size,
             target_notional,
             rebalance_drift_pct,
         }
@@ -39,6 +36,12 @@ impl SpotRebalanceDecider {
             status = ?pair.status,
             "Evaluating spot-perp pair"
         );
+
+        // Guard: transitional statuses — orders are in flight, don't interfere.
+        if pair.status.is_transitional() {
+            debug!(status = ?pair.status, "Transitional status, skipping evaluation");
+            return DeciderAction::DoNothing;
+        }
 
         match pair.status {
             PairStatus::Inactive => {
@@ -127,6 +130,8 @@ impl SpotRebalanceDecider {
                     DeciderAction::DoNothing
                 }
             }
+            // Transitional statuses handled by is_transitional() guard above.
+            _ => unreachable!("transitional status should be caught by guard"),
         }
     }
 }

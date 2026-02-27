@@ -16,8 +16,6 @@ pub struct SpotPerpStrategyConfig {
     pub min_funding_threshold: Decimal,
     /// Target dollar exposure per side (spot buy + perp short).
     pub target_notional: Decimal,
-    /// Maximum position size per symbol (USD).
-    pub max_position_size: Decimal,
     /// Delta drift threshold to trigger rebalance (% of target_notional).
     pub rebalance_drift_pct: Decimal,
     /// Minimum distance from liquidation price as % of mark price.
@@ -56,10 +54,6 @@ impl SpotPerpStrategyConfig {
         assert!(
             self.target_notional > Decimal::ZERO,
             "strategy.spot_perp.target_notional must be > 0"
-        );
-        assert!(
-            self.max_position_size > Decimal::ZERO,
-            "strategy.spot_perp.max_position_size must be > 0"
         );
         assert!(
             self.rebalance_drift_pct > Decimal::ZERO,
@@ -102,7 +96,6 @@ impl SpotPerpStrategyConfig {
     pub fn build_decider(&self) -> SpotRebalanceDecider {
         SpotRebalanceDecider::new(
             self.min_funding_threshold,
-            self.max_position_size,
             self.target_notional,
             self.rebalance_drift_pct,
         )
@@ -125,7 +118,6 @@ mod tests {
         let toml_str = r#"
             min_funding_threshold = "0.0001"
             target_notional = "1000"
-            max_position_size = "1000"
             rebalance_drift_pct = "10"
             liquidation_buffer_pct = "5"
             spot_instrument = "SOLUSDT-BN-SPOT"
@@ -143,7 +135,6 @@ mod tests {
         let cfg = SpotPerpStrategyConfig::from_strategy_map(&map);
         assert_eq!(cfg.min_funding_threshold, dec!(0.0001));
         assert_eq!(cfg.target_notional, dec!(1000));
-        assert_eq!(cfg.max_position_size, dec!(1000));
         assert_eq!(cfg.rebalance_drift_pct, dec!(10));
         assert_eq!(cfg.liquidation_buffer_pct, dec!(5));
     }
@@ -154,7 +145,6 @@ mod tests {
         let cfg = SpotPerpStrategyConfig::from_strategy_map(&map);
         let decider = cfg.build_decider();
         assert_eq!(decider.min_funding_threshold, dec!(0.0001));
-        assert_eq!(decider.max_position_size, dec!(1000));
         assert_eq!(decider.target_notional, dec!(1000));
         assert_eq!(decider.rebalance_drift_pct, dec!(10));
     }
@@ -181,7 +171,6 @@ mod tests {
         let toml_str = r#"
             min_funding_threshold = "0"
             target_notional = "1000"
-            max_position_size = "1000"
             rebalance_drift_pct = "10"
             liquidation_buffer_pct = "5"
             spot_instrument = "SOLUSDT-BN-SPOT"

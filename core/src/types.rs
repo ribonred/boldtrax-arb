@@ -83,13 +83,16 @@ impl Exchange {
 #[archive(check_bytes)]
 #[repr(u8)]
 pub enum Currency {
+    BNB,
     BTC,
     ETH,
-    XRP,
     USDT,
     USDC,
+    MIRA,
     SOL,
-    BNB,
+    STEEM,
+    ENSO,
+    XRP,
 }
 // list of pairs we care about
 #[derive(
@@ -115,6 +118,9 @@ pub enum Pairs {
     USDCUSDT,
     SOLUSDT,
     BNBUSDT,
+    STEEMUSDT,
+    ENSOUSDT,
+    MIRAUSDT,
 }
 
 impl Pairs {
@@ -126,6 +132,9 @@ impl Pairs {
             Pairs::USDCUSDT => Currency::USDC,
             Pairs::SOLUSDT => Currency::SOL,
             Pairs::BNBUSDT => Currency::BNB,
+            Pairs::STEEMUSDT => Currency::STEEM,
+            Pairs::ENSOUSDT => Currency::ENSO,
+            Pairs::MIRAUSDT => Currency::MIRA,
         }
     }
 
@@ -137,6 +146,9 @@ impl Pairs {
             Pairs::USDCUSDT => Currency::USDT,
             Pairs::SOLUSDT => Currency::USDT,
             Pairs::BNBUSDT => Currency::USDT,
+            Pairs::STEEMUSDT => Currency::USDT,
+            Pairs::ENSOUSDT => Currency::USDT,
+            Pairs::MIRAUSDT => Currency::MIRA,
         }
     }
 
@@ -148,6 +160,9 @@ impl Pairs {
             (Currency::USDC, Currency::USDT) => Some(Pairs::USDCUSDT),
             (Currency::SOL, Currency::USDT) => Some(Pairs::SOLUSDT),
             (Currency::BNB, Currency::USDT) => Some(Pairs::BNBUSDT),
+            (Currency::STEEM, Currency::USDT) => Some(Pairs::STEEMUSDT),
+            (Currency::ENSO, Currency::USDT) => Some(Pairs::ENSOUSDT),
+            (Currency::MIRA, Currency::USDT) => Some(Pairs::MIRAUSDT),
             _ => None,
         }
     }

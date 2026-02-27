@@ -1,9 +1,9 @@
 use crate::arbitrage::policy::{ExecutionError, ExecutionPolicy};
 use crate::arbitrage::spot_perp::types::SpotPerpPair;
-use crate::arbitrage::types::{DeciderAction, PairStatus};
+use crate::arbitrage::types::{DeciderAction, PairState, PairStatus};
 use async_trait::async_trait;
 use boldtrax_core::CoreApi;
-use boldtrax_core::types::{InstrumentKey, OrderRequest, OrderSide, OrderType};
+use boldtrax_core::types::{Exchange, InstrumentKey, Order, OrderRequest, OrderSide, OrderType};
 use boldtrax_core::zmq::router::ZmqRouter;
 use rust_decimal::Decimal;
 use tracing::{debug, error, info, warn};
@@ -17,8 +17,73 @@ impl SpotPerpExecutionEngine {
         Self { router }
     }
 
+    /// Cancel-replace: cancel all pending orders before dispatching fresh
+    /// rebalance orders. Prevents order accumulation when prior limit orders
+    /// have not yet filled or been cancelled within the poll interval.
+    async fn cancel_pending_orders(&mut self, pair: &mut SpotPerpPair) {
+        let pending: Vec<_> = pair
+            .order_tracker()
+            .all_pending()
+            .iter()
+            .map(|o| (o.key.exchange, o.order_id.clone()))
+            .collect();
+
+        if pending.is_empty() {
+            return;
+        }
+
+        info!(count = pending.len(), "Cancel-replace: cancelling pending orders before rebalance");
+        for (exchange, order_id) in pending {
+            if let Err(e) = self.router.cancel_order(exchange, order_id.clone()).await {
+                debug!(error = %e, %order_id, "Cancel failed (may already be terminal)");
+            }
+            pair.order_tracker_mut().force_cancel(&order_id);
+        }
+    }
+
     pub async fn execute(&mut self, action: DeciderAction, pair: &mut SpotPerpPair) {
         let _ = ExecutionPolicy::<SpotPerpPair>::execute(self, &action, pair).await;
+    }
+
+    /// Core two-leg dispatch: place spot + perp orders, register them
+    /// in the tracker, and advance the pair's lifecycle status.
+    ///
+    /// `reduce_only` applies to the perp leg only (spot never uses it).
+    /// `next_status` is `None` for actions that keep the current status
+    /// (e.g. Rebalance stays Active).
+    async fn dispatch_legs(
+        &mut self,
+        pair: &mut SpotPerpPair,
+        spot_size: Decimal,
+        perp_size: Decimal,
+        reduce_only: bool,
+        next_status: Option<PairStatus>,
+    ) -> Result<(), ExecutionError> {
+        let spot_key = pair.spot.key;
+        let perp_key = pair.perp.key;
+
+        let spot_order = self
+            .place_spot_order(
+                &spot_key,
+                spot_size,
+                pair.spot.best_bid,
+                pair.spot.best_ask,
+                pair.spot.ask_depth,
+                pair.spot.bid_depth,
+            )
+            .await?;
+        let perp_order = self
+            .place_perp_order(&perp_key, perp_size, reduce_only)
+            .await?;
+
+        let tracker = pair.order_tracker_mut();
+        tracker.track_if_some(spot_order, spot_key, spot_size);
+        tracker.track_if_some(perp_order, perp_key, perp_size);
+
+        if let Some(status) = next_status {
+            pair.status = status;
+        }
+        Ok(())
     }
 
     /// Place a spot order using LIMIT_MAKER (post-only) at the best orderbook
@@ -31,9 +96,9 @@ impl SpotPerpExecutionEngine {
         best_ask: Option<Decimal>,
         ask_depth: Option<Decimal>,
         bid_depth: Option<Decimal>,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<Option<Order>, ExecutionError> {
         if size.is_zero() {
-            return Ok(());
+            return Ok(None);
         }
 
         let side = if size.is_sign_positive() {
@@ -113,7 +178,7 @@ impl SpotPerpExecutionEngine {
             strategy_id: "arbitrage".to_string(),
         };
 
-        self.submit_order(req).await
+        self.submit_order(req).await.map(Some)
     }
 
     /// Place a perp order using Market for immediate execution.
@@ -122,9 +187,9 @@ impl SpotPerpExecutionEngine {
         key: &InstrumentKey,
         size: Decimal,
         reduce_only: bool,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<Option<Order>, ExecutionError> {
         if size.is_zero() {
-            return Ok(());
+            return Ok(None);
         }
 
         let side = if size.is_sign_positive() {
@@ -144,10 +209,10 @@ impl SpotPerpExecutionEngine {
             strategy_id: "arbitrage".to_string(),
         };
 
-        self.submit_order(req).await
+        self.submit_order(req).await.map(Some)
     }
 
-    async fn submit_order(&mut self, req: OrderRequest) -> Result<(), ExecutionError> {
+    async fn submit_order(&mut self, req: OrderRequest) -> Result<Order, ExecutionError> {
         info!(
             key = %req.key,
             side = %req.side,
@@ -161,8 +226,11 @@ impl SpotPerpExecutionEngine {
         let key = req.key;
         match self.router.submit_order(req).await {
             Ok(order) => {
-                info!("Order submitted: {:?}", order);
-                Ok(())
+                info!(
+                    client_order_id = %order.client_order_id,
+                    "Order submitted"
+                );
+                Ok(order)
             }
             Err(e) => {
                 error!("Failed to submit order: {}", e);
@@ -181,6 +249,21 @@ impl ExecutionPolicy<SpotPerpPair> for SpotPerpExecutionEngine {
         "zmq_execution_engine"
     }
 
+    async fn cancel_order(
+        &mut self,
+        exchange: Exchange,
+        order_id: String,
+    ) -> Result<(), ExecutionError> {
+        self.router
+            .cancel_order(exchange, order_id.clone())
+            .await
+            .map(|_| ())
+            .map_err(|e| ExecutionError::OrderFailed {
+                key: format!("{exchange:?}:{order_id}"),
+                reason: e.to_string(),
+            })
+    }
+
     async fn execute_inner(
         &mut self,
         action: &DeciderAction,
@@ -191,68 +274,71 @@ impl ExecutionPolicy<SpotPerpPair> for SpotPerpExecutionEngine {
                 size_long,
                 size_short,
             } => {
-                info!(
-                    "Executing Enter action: long={}, short={}",
-                    size_long, size_short
-                );
-                self.place_spot_order(
-                    &pair.spot.key.clone(),
+                info!("Executing Enter: spot={}, perp={}", size_long, size_short);
+                self.dispatch_legs(
+                    pair,
                     *size_long,
-                    pair.spot.best_bid,
-                    pair.spot.best_ask,
-                    pair.spot.ask_depth,
-                    pair.spot.bid_depth,
+                    *size_short,
+                    false,
+                    Some(PairStatus::Entering),
                 )
-                .await?;
-                self.place_perp_order(&pair.perp.key.clone(), *size_short, false)
-                    .await?;
-                // NOTE: status transitions to Active when both legs fill.
-                // The PositionUpdate (perp) and OrderUpdate (spot) events
-                // will confirm execution; don't set Active prematurely.
+                .await
             }
             DeciderAction::Rebalance {
                 size_long,
                 size_short,
             } => {
+                // Cancel-replace: clear stale/pending orders so we never
+                // accumulate multiple rebalance generations simultaneously.
+                self.cancel_pending_orders(pair).await;
+
                 info!(
-                    "Executing Rebalance action: long={}, short={}",
+                    "Executing Rebalance: spot={}, perp={}",
                     size_long, size_short
                 );
-                self.place_spot_order(
-                    &pair.spot.key.clone(),
-                    *size_long,
-                    pair.spot.best_bid,
-                    pair.spot.best_ask,
-                    pair.spot.ask_depth,
-                    pair.spot.bid_depth,
-                )
-                .await?;
-                self.place_perp_order(&pair.perp.key.clone(), *size_short, false)
-                    .await?;
+                // Rebalance stays Active — tracker just monitors completion.
+                self.dispatch_legs(pair, *size_long, *size_short, false, None)
+                    .await
             }
             DeciderAction::Exit => {
-                info!("Executing Exit action");
-                // Close spot: sell all held quantity
                 let spot_size = -pair.spot.quantity;
-                // Close perp: reverse the position
                 let perp_size = -pair.perp.position_size;
-                self.place_spot_order(
-                    &pair.spot.key.clone(),
-                    spot_size,
-                    pair.spot.best_bid,
-                    pair.spot.best_ask,
-                    pair.spot.ask_depth,
-                    pair.spot.bid_depth,
+                info!("Executing Exit: spot={}, perp={}", spot_size, perp_size);
+                self.dispatch_legs(pair, spot_size, perp_size, true, Some(PairStatus::Exiting))
+                    .await
+            }
+            DeciderAction::Recover {
+                size_long,
+                size_short,
+            } => {
+                info!("Executing Recover: spot={}, perp={}", size_long, size_short);
+                self.dispatch_legs(
+                    pair,
+                    *size_long,
+                    *size_short,
+                    false,
+                    Some(PairStatus::Recovering),
                 )
-                .await?;
-                self.place_perp_order(&pair.perp.key.clone(), perp_size, true)
-                    .await?;
-                pair.status = PairStatus::Inactive;
+                .await
+            }
+            DeciderAction::Unwind {
+                size_long,
+                size_short,
+            } => {
+                info!("Executing Unwind: spot={}, perp={}", size_long, size_short);
+                self.dispatch_legs(
+                    pair,
+                    *size_long,
+                    *size_short,
+                    true,
+                    Some(PairStatus::Unwinding),
+                )
+                .await
             }
             DeciderAction::DoNothing => {
                 debug!("No action required");
+                Ok(())
             }
         }
-        Ok(())
     }
 }

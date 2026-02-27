@@ -15,8 +15,6 @@ pub struct PerpPerpDecider {
     /// Optional exit threshold. If set, exit when spread drops below this.
     /// If `None`, exit immediately when spread < 0 (sign flip).
     pub exit_threshold: Option<Decimal>,
-    /// Maximum position size per symbol (USD).
-    pub max_position_size: Decimal,
     /// Target dollar exposure per side.
     pub target_notional: Decimal,
     /// Delta drift threshold as a percentage of `target_notional`.
@@ -27,14 +25,12 @@ impl PerpPerpDecider {
     pub fn new(
         min_spread_threshold: Decimal,
         exit_threshold: Option<Decimal>,
-        max_position_size: Decimal,
         target_notional: Decimal,
         rebalance_drift_pct: Decimal,
     ) -> Self {
         Self {
             min_spread_threshold,
             exit_threshold,
-            max_position_size,
             target_notional,
             rebalance_drift_pct,
         }
@@ -52,6 +48,12 @@ impl PerpPerpDecider {
             status = ?pair.status,
             "Evaluating perp-perp pair"
         );
+
+        // Guard: transitional statuses — orders are in flight, don't interfere.
+        if pair.status.is_transitional() {
+            debug!(status = ?pair.status, "Transitional status, skipping evaluation");
+            return DeciderAction::DoNothing;
+        }
 
         match pair.status {
             PairStatus::Inactive => {
@@ -202,6 +204,8 @@ impl PerpPerpDecider {
                     DeciderAction::DoNothing
                 }
             }
+            // Transitional statuses handled by is_transitional() guard above.
+            _ => unreachable!("transitional status should be caught by guard"),
         }
     }
 }

@@ -47,24 +47,8 @@ pub fn run_doctor() -> anyhow::Result<()> {
 
             println!("\nRisk Parameters:");
             println!("  Max Leverage: {}", config.risk.max_leverage);
-            println!("  Max Position Size: {}", config.risk.max_position_size);
-            println!("  Max Total Exposure: {}", config.risk.max_total_exposure);
-            println!("  Delta Threshold: {}", config.risk.delta_threshold);
-            println!("  Min Funding Rate: {}", config.risk.min_funding_rate);
-            println!(
-                "  Max Negative Funding Rate: {}",
-                config.risk.max_negative_funding_rate
-            );
-            println!(
-                "  Daily Drawdown Limit: {}%",
-                config.risk.daily_drawdown_limit_pct
-            );
 
             println!("\nFat-Finger Guards:");
-            println!(
-                "  Max Order Size: {}",
-                config.risk.fat_finger.max_order_size
-            );
             println!(
                 "  Max Order Notional: ${}",
                 config.risk.fat_finger.max_order_notional_usd

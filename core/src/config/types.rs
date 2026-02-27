@@ -2,7 +2,6 @@ use crate::types::{Exchange, ExecutionMode, InstrumentKey, InstrumentType, Pairs
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::time::Duration;
 
 // ── Fat-finger guard ──────────────────────────────────────────────────────────
@@ -11,8 +10,6 @@ use std::time::Duration;
 /// obviously wrong order requests before they reach the exchange.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FatFingerConfig {
-    /// Maximum allowed single order size in base asset units.
-    pub max_order_size: Decimal,
     /// Maximum allowed single order notional value in USD.
     pub max_order_notional_usd: Decimal,
     /// Maximum allowed price deviation from current market mid-price (%).
@@ -22,7 +19,6 @@ pub struct FatFingerConfig {
 impl Default for FatFingerConfig {
     fn default() -> Self {
         Self {
-            max_order_size: Decimal::new(10, 0),
             max_order_notional_usd: Decimal::new(100_000, 0),
             max_price_deviation_pct: Decimal::new(5, 0),
         }
@@ -33,13 +29,7 @@ impl Default for FatFingerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
-    pub max_position_size: Decimal,
-    pub max_total_exposure: Decimal,
     pub max_leverage: Decimal,
-    pub delta_threshold: Decimal,
-    pub min_funding_rate: Decimal,
-    pub max_negative_funding_rate: Decimal,
-    pub daily_drawdown_limit_pct: Decimal,
     #[serde(default)]
     pub fat_finger: FatFingerConfig,
 }
@@ -47,13 +37,7 @@ pub struct RiskConfig {
 impl Default for RiskConfig {
     fn default() -> Self {
         Self {
-            max_position_size: Decimal::from(1000),
-            max_total_exposure: Decimal::from(5000),
             max_leverage: Decimal::from(1),
-            delta_threshold: Decimal::from_str("0.05").unwrap(),
-            min_funding_rate: Decimal::from_str("0.0001").unwrap(),
-            max_negative_funding_rate: Decimal::from_str("-0.001").unwrap(),
-            daily_drawdown_limit_pct: Decimal::from(5),
             fat_finger: FatFingerConfig::default(),
         }
     }
@@ -313,24 +297,6 @@ impl AppConfig {
 
         if self.risk.max_leverage <= Decimal::ZERO {
             errors.push("risk.max_leverage must be > 0".to_string());
-        }
-        if self.risk.max_position_size <= Decimal::ZERO {
-            errors.push("risk.max_position_size must be > 0".to_string());
-        }
-        if self.risk.max_total_exposure <= Decimal::ZERO {
-            errors.push("risk.max_total_exposure must be > 0".to_string());
-        }
-        if self.risk.daily_drawdown_limit_pct <= Decimal::ZERO {
-            errors.push("risk.daily_drawdown_limit_pct must be > 0".to_string());
-        }
-        if self.risk.delta_threshold <= Decimal::ZERO {
-            errors.push("risk.delta_threshold must be > 0".to_string());
-        }
-        if self.risk.min_funding_rate <= Decimal::ZERO {
-            errors.push("risk.min_funding_rate must be > 0".to_string());
-        }
-        if self.risk.fat_finger.max_order_size <= Decimal::ZERO {
-            errors.push("risk.fat_finger.max_order_size must be > 0".to_string());
         }
         if self.risk.fat_finger.max_order_notional_usd <= Decimal::ZERO {
             errors.push("risk.fat_finger.max_order_notional_usd must be > 0".to_string());

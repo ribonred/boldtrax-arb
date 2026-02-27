@@ -13,6 +13,7 @@ use boldtrax_core::types::{Exchange, ExecutionMode};
 use boldtrax_core::zmq::client::ZmqClient;
 use boldtrax_core::zmq::discovery::{DiscoveryClient, ServiceType};
 use boldtrax_core::zmq::router::ZmqRouter;
+use boldtrax_core::zmq::strategy_server::{StrategyCommandServer, StrategyServerConfig};
 use strategies::arbitrage::engine::ArbitrageEngine;
 use strategies::arbitrage::oracle::PriceOracle;
 use strategies::arbitrage::paper::PaperExecution;
@@ -227,25 +228,45 @@ async fn spawn_spot_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
 
     let execution_mode = app_config.execution_mode;
 
+    // Derive strategy ID and create command server
+    let strategy_id = format!(
+        "SpotPerp:{}:{}/{}",
+        exchange, strategy_config.spot_instrument, strategy_config.perp_instrument
+    );
+    let server_config = StrategyServerConfig {
+        strategy_id: strategy_id.clone(),
+        redis_url: app_config.redis_url.clone(),
+        ttl_secs: 30,
+    };
+    let (server, cmd_rx) = StrategyCommandServer::new(server_config);
+
     let handle = match execution_mode {
         ExecutionMode::Paper => {
             let execution = PaperExecution::new(SpotPerpExecutionEngine::new(router));
-            let engine = ArbitrageEngine::new(pair, oracle, decider, margin, execution);
-            let runner = StrategyRunner::SpotPerpPaper(engine, event_subscriber);
+            let engine = ArbitrageEngine::new(pair, oracle, decider, margin, execution)
+                .with_strategy_id(&strategy_id);
+            let server = server.with_status_watch(engine.status_watch());
+            tokio::spawn(async move { server.run().await });
+            let runner = StrategyRunner::SpotPerpPaper(engine, event_subscriber, cmd_rx);
             info!(
                 strategy = "SpotPerp",
                 mode = "paper",
+                %strategy_id,
                 "Strategy runner spawned"
             );
             tokio::spawn(async move { runner.run().await })
         }
         ExecutionMode::Live => {
             let execution = SpotPerpExecutionEngine::new(router);
-            let engine = ArbitrageEngine::new(pair, oracle, decider, margin, execution);
-            let runner = StrategyRunner::SpotPerp(engine, event_subscriber);
+            let engine = ArbitrageEngine::new(pair, oracle, decider, margin, execution)
+                .with_strategy_id(&strategy_id);
+            let server = server.with_status_watch(engine.status_watch());
+            tokio::spawn(async move { server.run().await });
+            let runner = StrategyRunner::SpotPerp(engine, event_subscriber, cmd_rx);
             info!(
                 strategy = "SpotPerp",
                 mode = "live",
+                %strategy_id,
                 "Strategy runner spawned"
             );
             tokio::spawn(async move { runner.run().await })
@@ -391,21 +412,41 @@ async fn spawn_perp_perp(app_config: &AppConfig) -> anyhow::Result<JoinHandle<()
 
     let execution = PerpPerpExecutionEngine::new(router.clone());
 
-    let poller = PerpPerpPoller {
+    // Derive strategy ID and create command server
+    let strategy_id = format!(
+        "PerpPerp:{}:{}/{}:{}",
+        exchange_long,
+        strategy_config.perp_long_instrument,
+        exchange_short,
+        strategy_config.perp_short_instrument
+    );
+    let server_config = StrategyServerConfig {
+        strategy_id: strategy_id.clone(),
+        redis_url: app_config.redis_url.clone(),
+        ttl_secs: 30,
+    };
+    let (server, cmd_rx) = StrategyCommandServer::new(server_config);
+
+    let poller = PerpPerpPoller::new(
         pair,
         decider,
         execution,
         margin,
         oracle,
         router,
-        poll_interval: strategy_config.poll_interval(),
-    };
+        strategy_config.poll_interval(),
+    )
+    .with_strategy_id(&strategy_id);
 
-    let runner = StrategyRunner::PerpPerp(Box::new(poller), sub_long, sub_short);
+    let server = server.with_status_watch(poller.status_watch());
+    tokio::spawn(async move { server.run().await });
+
+    let runner = StrategyRunner::PerpPerp(Box::new(poller), sub_long, sub_short, cmd_rx);
     info!(
         strategy = "PerpPerp",
         mode = ?app_config.execution_mode,
         poll_interval_secs = strategy_config.poll_interval_secs,
+        %strategy_id,
         "Strategy runner spawned"
     );
     let handle = tokio::spawn(async move { runner.run().await });

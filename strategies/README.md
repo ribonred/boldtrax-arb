@@ -4,7 +4,37 @@
 
 This module implements automated arbitrage strategies for the boldtrax-bot system.
 All strategies are composed from pluggable policy traits (decision, execution,
-margin, price) wired through a generic `ArbitrageEngine<D, E, M, P>`.
+margin, price) wired through either an event-driven `ArbitrageEngine` (spot-perp)
+or a poll-based `PerpPerpPoller` (perp-perp).
+
+Two strategy types are fully implemented:
+- **Spot-Perp** — single-exchange, event-driven, captures perp funding rate
+- **Perp-Perp** — cross-exchange, poll-based, captures funding rate differential
+
+---
+
+## Lifecycle States
+
+Every pair follows this lifecycle managed by `PairStatus`:
+
+```
+Inactive ──► Entering ──► Active ──► Exiting ──► Inactive
+                │              │          ▲
+                ▼              ▼          │
+            Recovering ──► Active    Unwinding ──► Inactive
+```
+
+| Status | Description |
+|---|---|
+| `Inactive` | No open position — waiting for entry signal |
+| `Entering` | Entry orders placed, waiting for both legs to fill |
+| `Active` | Both legs filled and hedged — normal operation |
+| `Exiting` | Exit orders placed, market close in progress |
+| `Recovering` | One leg orphaned — smart recovery in progress |
+| `Unwinding` | Command-driven graceful close — chunked over multiple cycles |
+
+Transitional statuses (`Entering`, `Exiting`, `Recovering`, `Unwinding`) block the
+decider from emitting new actions. The engine handles retries internally.
 
 ---
 
@@ -14,31 +44,17 @@ margin, price) wired through a generic `ArbitrageEngine<D, E, M, P>`.
 
 Capture the **perpetual funding rate** by holding a delta-neutral position:
 
-1. **Buy spot** (the underlying asset) — tracked via account balance, NOT a position.
-2. **Short the perpetual** — tracked via a Position with leverage, liquidation price, etc.
-3. When the perp funding rate is positive, **shorts receive funding from longs**.
-   We earn that payment while "hedged" by our spot holding.
+1. **Buy spot** (tracked via account balance, NOT a position)
+2. **Short the perpetual** (tracked via a `Position` with leverage + liquidation price)
+3. When perp funding rate is positive, shorts receive funding from longs
 
-### Key Invariants
+### Decision Logic (`SpotRebalanceDecider`)
 
-| Property | Spot Leg | Perp Leg |
-|---|---|---|
-| **InstrumentType** | `Spot` | `Swap` |
-| **Funding rate** | Does NOT exist | Exists — drives entry/exit |
-| **Position tracking** | Account balance (`quantity * price`) | `Position` struct (`size`, `entry_price`, `liquidation_price`) |
-| **Liquidation risk** | None | Yes — must monitor liquidation distance |
-| **Delta contribution** | `+quantity × spot_price` (positive, we're long) | `position_size × mark_price` (negative when short) |
-| **Price source** | OrderBook / Ticker for the Spot key | OrderBook / Ticker for the Swap key + FundingRate events |
-
-### Decision Logic (RebalanceDecider)
-
-- **Enter**: perp `funding_rate >= min_funding_threshold` while pair is `Inactive`.
-  Buy spot + short perp for the target notional.
-- **Exit**: perp `funding_rate < 0` while pair is `Active` (we'd start paying, not earning).
-- **Rebalance**: when `|total_delta| > threshold` (delta drifted too far from zero).
-  Computes a **correction delta** (`half_delta / price` per leg) — not the full target —
-  so each rebalance nudges the pair back toward neutral without overshooting.
-- **DoNothing**: otherwise.
+- **Enter**: perp `funding_rate >= min_funding_threshold` while `Inactive`
+- **Exit**: perp `funding_rate < 0` while `Active`
+- **Rebalance**: `|total_delta| > target_notional × rebalance_drift_pct / 100`
+  — splits half-delta correction across both legs
+- **DoNothing**: otherwise
 
 ### Delta Calculation
 
@@ -47,63 +63,117 @@ total_delta = spot.quantity × spot.current_price
             + perp.position_size × perp.current_price
 ```
 
-For a perfectly hedged position: spot quantity positive, perp position_size negative,
-`total_delta ≈ 0`. Positive means we're net-long, negative means net-short.
-
 ### Data Model
 
-```
-SpotLeg {
-    key: InstrumentKey       // (exchange, pair, Spot)
-    quantity: Decimal         // from account balance
-    avg_cost: Decimal         // average entry price for spot buys
-    current_price: Decimal    // latest mid-price from oracle
-    best_bid: Option<Decimal> // from latest orderbook snapshot
-    best_ask: Option<Decimal> // from latest orderbook snapshot
-}
-
-PerpLeg {
-    key: InstrumentKey        // (exchange, pair, Swap)
-    position_size: Decimal    // negative when short
-    entry_price: Decimal      // from PositionUpdate
-    current_price: Decimal    // mark/mid price from oracle
-    funding_rate: Decimal     // from FundingRate event
-    best_bid: Option<Decimal> // from latest orderbook snapshot
-    best_ask: Option<Decimal> // from latest orderbook snapshot
-}
-
-SpotPerpPair {
-    spot: SpotLeg
-    perp: PerpLeg
-    target_notional: Decimal  // target dollar exposure per side
-    status: PairStatus        // Inactive | Active
-    last_spot_partial_fill: Decimal // tracks incremental spot fills
-}
-```
-
-### Event Routing in the Engine
-
-| ZmqEvent | Spot Leg | Perp Leg |
+| Component | Spot Leg | Perp Leg |
 |---|---|---|
-| `FundingRate` | Seeds `spot.current_price` from `index_price` if zero | Update `perp.funding_rate`, seed `perp.current_price` from `mark_price`, trigger evaluation |
-| `OrderBook` / `Ticker` | Update `spot.current_price` via oracle | Update `perp.current_price` via oracle |
-| `PositionUpdate` | **Ignored** — spot uses account balance | Update `perp.position_size`, `perp.entry_price` |
-| `AccountSnapshot` | Could be used to update `spot.quantity` | Margin checks on account-level leverage |
-| `OrderUpdate` | **Track spot fills** — updates `spot.quantity` from partial + final fills | Log only |
+| InstrumentType | `Spot` | `Swap` |
+| Funding rate | None | Drives entry/exit |
+| Position tracking | Account balance (`quantity × price`) | `Position` struct |
+| Liquidation risk | None | Yes — monitored |
+| Price source | OrderBook / Ticker | OrderBook / Ticker + FundingRate |
 
-### Margin Checks
+### Execution
 
-- **Account-level**: leverage ratio check on the `AccountSnapshot` (applies to perp side).
-- **Position-level**: liquidation distance check on the perp `Position` only.
-  Spot has no liquidation — `SpotMarginPolicy` always returns `Ok`.
+| Leg | Entry/Rebalance | Exit |
+|---|---|---|
+| Spot | `LIMIT_MAKER` (post_only) at best bid/ask | Market |
+| Perp | Market | Market + `reduce_only` |
+
+**Rationale**: Spot uses `LIMIT_MAKER` to earn maker fee rebates. Perp uses Market
+for immediate fill certainty since it has liquidation risk.
 
 ---
 
-## Strategy: Perp-Perp Cross-Exchange (Future)
+## Strategy: Perp-Perp Cross-Exchange Arbitrage
 
-Long on one exchange, short on the other, capturing funding rate differential.
-Both legs are `Swap` instruments. Both have funding rates, positions, and liquidation risk.
-**Not yet implemented** — will use a different pair type (`PerpPerpPair`) with `spread() = funding_a - funding_b`.
+### Objective
+
+Capture the **funding rate differential** between two exchanges:
+
+1. **Long perp** on one exchange (where funding rate is lower / we receive)
+2. **Short perp** on another exchange (where funding rate is higher / we receive)
+3. Earn from the spread between the two funding rates
+
+### Decision Logic (`PerpPerpDecider`)
+
+- **Enter**: `funding_spread >= min_spread_threshold` while `Inactive`.
+  Detects one-legged orphan positions and recovers them on entry.
+- **Exit**: spread drops below `exit_threshold` (or < 0 if unset) while `Active`
+- **Rebalance**: `|total_delta| > target_notional × rebalance_drift_pct / 100`
+- **DoNothing**: otherwise
+
+Funding spread is directional based on `CarryDirection` (`Positive` or `Negative`).
+
+### Data Model
+
+Both legs are `PerpLeg` structs: instrument key, position size, entry price, mark price,
+funding rate, best bid/ask, and top-3 depth. `FundingCache` provides staleness-aware
+in-memory caching of funding rate snapshots.
+
+### Execution
+
+| Action | Order Type | Notes |
+|---|---|---|
+| Entry | Limit + post_only at best bid/ask | Maker fees on both legs |
+| Rebalance | Cancel-replace, then Limit + post_only | Cancels stale orders first |
+| Exit | Market + reduce_only | Immediate close |
+| Recovery | Limit + post_only on missing leg | Smart recovery system |
+| Unwind | Market + reduce_only (chunked) | Gradual close |
+
+### Cancel-Replace Pattern
+
+Before dispatching rebalance orders, the execution engine cancels all pending tracked
+orders via `cancel_pending_orders()`. This prevents order accumulation when prior limit
+orders haven't filled within the poll interval. Each cancelled order is also force-marked
+terminal in the tracker.
+
+---
+
+## Safety Systems
+
+### Smart Recovery (`recovery.rs`)
+
+When one leg fails during entry (partial fill, rejection), the pair enters `Recovering`
+status. The recovery system uses economic analysis to decide the best action:
+
+| Rule | Condition | Decision |
+|---|---|---|
+| Time backstop | > 60s elapsed | **Abort** — close the filled leg |
+| Large loss | PnL loss > 0.3% of notional | **Abort** |
+| Profit capture | PnL profit > crossing cost (5 bps) | **Abort** (bank it) |
+| Loss recovery | PnL loss > crossing cost | **Chase** (market order) |
+| No resting order | Order tracker empty | **Reprice** (new limit) |
+| Stale order | Order older than threshold | **Reprice** |
+| Default | — | **Rest** (wait for fill) |
+
+### Emergency Margin Exit
+
+When a position's liquidation distance falls below the configured safety
+buffer (`liquidation_buffer_pct`), the engine triggers an emergency exit:
+
+1. **Cancel** all in-flight orders (free margin)
+2. **Force exit** — market close both legs (`DeciderAction::Exit`)
+3. **Pause** — strategy paused to prevent re-entry while account is at risk
+
+This fires when the pair is `Active` or `Entering`. Transitional statuses
+(`Exiting`, `Recovering`, `Unwinding`) already have their own close logic.
+The engine remains paused until manually resumed via `stratctl resume`.
+
+### Stale Order Cancellation
+
+Orders pending longer than the configured timeout are auto-cancelled:
+- **ArbitrageEngine** (spot-perp): 60s timeout, checked every 30s
+- **PerpPerpPoller**: 10s timeout, checked every poll cycle
+
+Stale cancellation is **skipped** during `Entering` and `Recovering` — entry orders
+need time to fill on illiquid pairs, and recovery manages its own orders.
+
+### Depth Gate
+
+Entry and rebalance orders are gated by orderbook depth analysis. If the available
+depth at the top 3 levels is insufficient for the planned order size, the action is
+skipped. Exit/Unwind orders are never depth-gated (closing is mandatory).
 
 ---
 
@@ -111,114 +181,271 @@ Both legs are `Swap` instruments. Both have funding rates, positions, and liquid
 
 ### Policy Traits
 
-All traits use a **template method** pattern: implementors supply `_inner` methods (pure logic),
+All traits use a **template method** pattern: implementors supply `_inner` methods,
 the default wrapper adds structured `tracing` spans and `monotonic_counter` metrics.
 
-| Trait | Purpose | Generic over pair? |
+| Trait | Purpose | Generic? |
 |---|---|---|
 | `DecisionPolicy<P: PairState>` | `evaluate(pair) → DeciderAction` | Yes |
 | `ExecutionPolicy<P: PairState>` | `execute(action, pair)` — places orders | Yes |
-| `MarginPolicy` | `check_account` + `check_position` | No (uses `AccountSnapshot` + `Position`) |
-| `PriceSource` | `update_snapshot` / `update_ticker` / `get_mid_price` | No (keyed by `InstrumentKey`) |
+| `MarginPolicy` | `check_account` + `check_position` | No |
+| `PriceSource` | `update_snapshot` / `update_ticker` / `get_mid_price` | No |
 
 ### PairState Trait
 
-The `PairState` trait abstracts any tradable pair type, allowing the engine to be
-fully pair-agnostic. Any pair struct (e.g. `SpotPerpPair`, future `PerpPerpPair`)
-must implement:
+Abstracts any tradable pair type. Both `SpotPerpPair` and `PerpPerpPair` implement it.
 
 | Method | Purpose |
 |---|---|
 | `total_delta()` | Net delta exposure across all legs |
-| `status()` / `set_status()` | Current pair lifecycle state |
-| `apply_event(ZmqEvent) → bool` | Route pair-specific events (e.g. FundingRate, PositionUpdate, OrderUpdate for spot fills). Returns `true` if evaluation should trigger. |
-| `refresh_prices(oracle_fn)` | Update leg prices from the oracle |
-| `refresh_orderbook(bid_fn, ask_fn)` | Update leg `best_bid`/`best_ask` from the oracle for smart order placement |
+| `status()` / `set_status()` | Current lifecycle state |
+| `apply_event(ZmqEvent) → bool` | Route pair-specific events, return true if evaluation should trigger |
+| `refresh_prices(oracle_fn)` | Update leg prices from oracle |
+| `refresh_orderbook(bid, ask, bid_depth, ask_depth)` | Update orderbook data for smart order placement |
 | `positions_for_margin_check()` | Enumerate positions needing margin validation |
+| `is_fully_entered()` / `is_fully_exited()` | Position completeness checks |
+| `close_sizes()` | Sizes to fully close both legs |
+| `has_sufficient_depth(long, short)` | Orderbook depth gate |
+| `recovery_sizes()` | Compute notional-matching sizes for the missing leg |
 
-### Engine
+### Engine Variants
 
-```
-ArbitrageEngine<Pair: PairState, D: DecisionPolicy<Pair>, E: ExecutionPolicy<Pair>, M: MarginPolicy, P: PriceSource>
-```
+| Strategy | Engine | Event Model |
+|---|---|---|
+| Spot-Perp | `ArbitrageEngine<SpotPerpPair, D, E, M, P>` | Event-driven via ZMQ subscriber |
+| Perp-Perp | `PerpPerpPoller<M, P>` | Poll-based (configurable interval) + event-driven for order updates |
 
-- Static dispatch, zero vtable overhead.
-- Fully pair-agnostic — all pair-specific logic delegated via `PairState` trait.
-- Uses `&mut self` methods — no argument explosion, struct stays intact.
-- `run(subscriber)` — production entry point driven by ZMQ events.
-- `run_with_stream(rx)` — test/simulation entry point driven by a channel.
-  Returns `(Pair, E)` for assertions.
+Both engines share the same lifecycle state machine, stale order handling,
+margin checks, and command handling.
 
-### Event Flow
+### StrategyRunner
 
-```
-ZmqEvent arrives
-  ├─ OrderBook / Ticker / OrderBookUpdate → oracle (universal)
-  ├─ OrderUpdate → pair.apply_event (spot fill tracking) + log
-  └─ everything else → pair.apply_event(event)
-       └─ if true → evaluate_and_execute()
-            ├─ margin.check_account (gate)
-            ├─ pair.refresh_prices (from oracle)
-            ├─ pair.refresh_orderbook (bid/ask from oracle)
-            ├─ margin.check_position (per-leg gate)
-            └─ decider.evaluate → execution.execute
+Top-level dispatch enum that wraps the concrete engine variants:
+
+```rust
+enum StrategyRunner {
+    SpotPerp(SpotPerpEngine, ZmqEventSubscriber, cmd_rx),
+    SpotPerpPaper(SpotPerpPaperEngine, ZmqEventSubscriber, cmd_rx),
+    PerpPerp(PerpPerpPoller, long_sub, short_sub, cmd_rx),
+}
 ```
 
-### Execution Strategy
+### Paper Trading
 
-The `ExecutionEngine` uses **instrument-aware order placement**:
+`PaperExecution<P, E>` decorates any `ExecutionPolicy`, intercepting all actions:
+- Enter/Rebalance/Recover → simulates instant fill, sets `Active`
+- Exit/Unwind → simulates close, sets `Inactive`
+- No real orders placed. Logs with `mode = "paper"`.
 
-| Leg | Order Type | Pricing | `post_only` | `reduce_only` |
-|---|---|---|---|---|
-| **Spot BUY** | `LIMIT_MAKER` | Best ask from orderbook | `true` | `false` (not supported) |
-| **Spot SELL** | `LIMIT_MAKER` | Best bid from orderbook | `true` | `false` (not supported) |
-| **Perp (enter/rebalance)** | `MARKET` | N/A | `false` | `false` |
-| **Perp (exit)** | `MARKET` | N/A | `false` | `true` |
-
-**Rationale**: Spot uses `LIMIT_MAKER` (Binance's post-only order type) to earn maker fee
-rebates rather than paying taker fees. Falls back to `MARKET` if no orderbook data is available.
-Perp uses `MARKET` for immediate fill certainty since the perp side has liquidation risk.
+Generic over `P: PairState` — works with any pair type.
 
 ### REST Response Handling
 
 All order-related REST calls use `ResponseExt::json_logged()` from `core/src/http/client.rs`.
-This reads the response body as text first, then parses JSON. On parse failure the **full raw body**
-is logged at ERROR level — we never silently lose exchange payloads.
-
-Three tiers of response parsing are available:
+On parse failure, the full raw body is logged at ERROR level.
 
 | API | Use Case |
 |---|---|
-| `resp.json_logged(ctx)` | Simple parse + log raw body on failure |
-| `check_and_parse(resp, ctx, detector)` | Run an `fn(&str) -> Option<String>` error detector before parsing — catches HTTP 200 with error payload (Kraken, some Binance edge cases) |
-| `resp.text_logged(ctx)` | Returns `(body, status)` for full manual control |
+| `resp.json_logged(ctx)` | Standard parse + log raw body on failure |
+| `check_and_parse(resp, ctx, detector)` | Catches HTTP 200 with error payload |
+| `resp.text_logged(ctx)` | Full manual control `(body, status)` |
 
-### Binance-Specific: `newOrderRespType=RESULT`
+---
 
-Binance spot API defaults to `ACK` response type for `LIMIT_MAKER` orders, which only returns
-`symbol`, `orderId`, `clientOrderId`, `transactTime` — missing the fields we need (`price`,
-`origQty`, `executedQty`, `status`). We force `&newOrderRespType=RESULT` on all spot order
-submissions so the full response is always returned.
+## Event Flow
 
-### Order Manager Resilience
+### ArbitrageEngine (Spot-Perp)
 
-If the REST response fails to parse but the WebSocket has already confirmed the order
-(status moved beyond `PendingSubmit` to `New`), the order manager does **not** reject the
-order. It logs a WARN and keeps the order alive, relying on WS for further updates.
-Only orders still in `PendingSubmit` state are rejected on REST failure.
-
-### Paper Trading
-
-`PaperExecution<E>` decorates any `ExecutionPolicy`, simulating instant fills
-(status → `Active` on enter, `Inactive` on exit) without sending real orders.
-
-### Runner
-
-`StrategyRunner` enum seals all valid engine type combinations:
+Event-driven — evaluates on every relevant ZMQ event:
 
 ```
-SpotPerpEngine       = ArbitrageEngine<SpotPerpPair, SpotRebalanceDecider, ExecutionEngine, MarginManager, PriceOracle>
-SpotPerpPaperEngine  = ... same with PaperExecution<ExecutionEngine> ...
+ZmqEvent arrives
+  ├─ OrderBook / Ticker → oracle
+  ├─ OrderUpdate → tracker + pair.apply_event + check_tracker_transitions
+  └─ FundingRate / PositionUpdate → pair.apply_event
+       └─ if true → evaluate_and_execute()
+            ├─ margin.check_account (gate)
+            ├─ transitional status retry loops
+            ├─ refresh prices + orderbook
+            ├─ margin.check_position → EMERGENCY EXIT if near liquidation
+            └─ decider.evaluate → depth gate → execution.execute
+```
+
+### PerpPerpPoller (Perp-Perp)
+
+Poll-based — evaluates on configurable interval:
+
+```
+Every poll_interval_secs:
+  1. Refresh funding rates (cache or API)
+  2. Refresh prices + orderbook from oracle
+  3. Sync positions from exchange
+  3a. Cancel stale orders (skip during Entering/Recovering)
+  3b. Handle transitional statuses (Recovering/Exiting/Unwinding)
+  4. Margin checks → EMERGENCY EXIT if near liquidation
+  5. Decision → depth gate → execution
+```
+
+Events are also processed between polls (OrderBook, Ticker, OrderUpdate, etc.)
+for real-time position tracking and lifecycle transitions.
+
+---
+
+## CLI: Strategy Control (`stratctl`)
+
+Control running strategies from the command line. Communicates via ZMQ DEALER→ROUTER
+through Redis service discovery.
+
+### Commands
+
+```bash
+# List all running strategies with their status
+boldtrax-bot stratctl list
+boldtrax-bot ctl list          # alias
+
+# Get status of a specific strategy (auto-selects if only one running)
+boldtrax-bot stratctl status
+boldtrax-bot stratctl status -s "perp_perp_BTCUSDT"
+
+# Pause strategy evaluation (stops new entries/rebalances/exits)
+boldtrax-bot stratctl pause
+boldtrax-bot stratctl pause -s "perp_perp_BTCUSDT"
+
+# Resume evaluation after pause (e.g. after emergency margin exit)
+boldtrax-bot stratctl resume
+boldtrax-bot stratctl resume -s "perp_perp_BTCUSDT"
+
+# Graceful exit — chunked unwind over multiple cycles (4 chunks default)
+boldtrax-bot stratctl exit
+
+# Force exit — immediate market close of all positions
+boldtrax-bot stratctl exit --force
+boldtrax-bot stratctl exit -s "perp_perp_BTCUSDT" --force
+```
+
+### Status Output
+
+```
+Running strategies (1):
+  perp_perp_BTCUSDT — Active | pending_orders: 0
+```
+
+When paused (e.g. after emergency margin exit):
+```
+Running strategies (1):
+  perp_perp_BTCUSDT — Inactive | pending_orders: 0 [PAUSED]
+```
+
+### Strategy Commands
+
+| Command | Effect |
+|---|---|
+| `GetStatus` | Returns current pair status, pause state, pending order count |
+| `Pause` | Sets `paused = true` — evaluation becomes a no-op, events still processed |
+| `Resume` | Sets `paused = false` — triggers immediate evaluation |
+| `GracefulExit` | Only from `Active`. Starts chunked unwind (4 chunks). Status → `Unwinding` |
+| `ForceExit` | From any state with positions. Market close both legs. Status → `Exiting` |
+
+---
+
+## CLI: Manual Trading REPL
+
+Interactive REPL for manual order management via ZMQ.
+
+```bash
+boldtrax-bot manual -e binance
+boldtrax-bot manual -e bybit
+```
+
+### Commands
+
+```
+>> help
+Available commands:
+  balance                           — Account snapshot (balances, margin)
+  positions                         — All open positions
+  position <pair> <type>            — Single position lookup
+  instruments                       — All tradeable instruments
+  fundingrate <instrument_key>      — Cached funding rate snapshot
+  buy <pair> <type> <size> [price]  — Buy order (market if no price)
+  sell <pair> <type> <size> [price] — Sell order (limit if price given)
+  cancel <order_id>                 — Cancel an order
+  exit                              — Quit REPL
+```
+
+### Examples
+
+```bash
+>> balance
+AccountSnapshot { exchange: Binance, ... }
+
+>> positions
+[Position { key: BTCUSDT-BN-SWAP, size: -0.01, ... }]
+
+>> position BTCUSDT swap
+Position { key: BTCUSDT-BN-SWAP, size: -0.01, entry_price: 95000, ... }
+
+>> buy BTCUSDT swap 0.01
+Order submitted: Order { ... }
+
+>> sell BTCUSDT swap 0.01 95500
+Order submitted: Order { ... }
+
+>> cancel abc123
+Order canceled: Order { ... }
+
+>> fundingrate BTCUSDT-BN-SWAP
+FundingRateSnapshot { funding_rate: 0.0001, mark_price: 95100, ... }
+```
+
+The REPL spawns a background task that prints order updates and position changes
+in real-time as ZMQ events arrive.
+
+---
+
+## Configuration
+
+### Spot-Perp (`config/strategies/spot_perp.toml`)
+
+```toml
+[strategy.spot_perp]
+# Minimum perp funding rate to justify entering (0.01% = typical positive rate)
+min_funding_threshold = "0.00003"
+# Target dollar exposure per side (spot buy + perp short)
+target_notional = "280"
+# Delta drift threshold to trigger rebalance (% of target_notional)
+rebalance_drift_pct = "10"
+# Minimum distance from liquidation price as % of mark price
+liquidation_buffer_pct = "15"
+# Full InstrumentKey strings
+spot_instrument = "XRPUSDT-BN-SPOT"
+perp_instrument = "XRPUSDT-BN-SWAP"
+```
+
+### Perp-Perp (`config/strategies/perp_perp.toml`)
+
+```toml
+[strategy.perp_perp]
+# Carry direction: "positive" (long leg receives funding) or "negative"
+carry_direction = "negative"
+# Minimum |long_rate - short_rate| spread to enter a position
+min_spread_threshold = "0.0001"
+# Optional: exit when spread drops below this value
+# If omitted, exits immediately when spread flips sign (< 0)
+# exit_threshold = "0.00003"
+# Target dollar exposure per side (long + short)
+target_notional = "450"
+# Delta drift threshold to trigger rebalance (% of target_notional)
+rebalance_drift_pct = "10"
+# Minimum distance from liquidation price as % of mark price
+liquidation_buffer_pct = "10"
+# Full InstrumentKey strings — must end in -SWAP
+perp_long_instrument = "MIRAUSDT-BN-SWAP"
+perp_short_instrument = "MIRAUSDT-BY-SWAP"
+# How often to poll funding rates via ZMQ (seconds)
+poll_interval_secs = 5
+# Cache staleness threshold (seconds)
+cache_staleness_secs = 2
 ```
 
 ---
@@ -228,5 +455,8 @@ SpotPerpPaperEngine  = ... same with PaperExecution<ExecutionEngine> ...
 - **Spot-Perp**: ONE funding rate (the perp's). Spot has no funding, no position, no liquidation.
 - **Perp-Perp**: TWO funding rates. Both legs have positions and liquidation risk.
   These are entirely different data models and decision logic.
-- `ArbitrageLeg` (old, removed) treated both legs identically with `funding_rate` and
-  `position_size` — incorrect for spot-perp because spot has neither.
+- **ArbitrageEngine**: Event-driven, used for spot-perp. Single ZMQ subscriber.
+- **PerpPerpPoller**: Poll-based, used for perp-perp. Two ZMQ subscribers (one per exchange).
+- **GracefulExit vs ForceExit**: Graceful = chunked unwind (4 rounds), Force = immediate market close.
+- **Paused vs Inactive**: Paused blocks evaluation but the engine is still running (events processed).
+  Inactive means no positions — ready for new entry when conditions are met.

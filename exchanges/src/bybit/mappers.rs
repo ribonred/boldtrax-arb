@@ -87,27 +87,27 @@ pub fn order_book_to_snapshot(
     ob: &BybitOrderBookResult,
     key: InstrumentKey,
 ) -> Option<OrderBookSnapshot> {
-    let bids: Vec<PriceLevel> = ob
-        .b
-        .iter()
-        .filter_map(|level| {
-            let price = Decimal::from_str(&level[0]).ok()?;
-            let quantity = Decimal::from_str(&level[1]).ok()?;
-            Some(PriceLevel { price, quantity })
-        })
-        .collect();
+    let bids: Vec<PriceLevel> =
+        ob.b.iter()
+            .filter_map(|level| {
+                let price = Decimal::from_str(&level[0]).ok()?;
+                let quantity = Decimal::from_str(&level[1]).ok()?;
+                Some(PriceLevel { price, quantity })
+            })
+            .collect();
 
-    let asks: Vec<PriceLevel> = ob
-        .a
-        .iter()
-        .filter_map(|level| {
-            let price = Decimal::from_str(&level[0]).ok()?;
-            let quantity = Decimal::from_str(&level[1]).ok()?;
-            Some(PriceLevel { price, quantity })
-        })
-        .collect();
+    let asks: Vec<PriceLevel> =
+        ob.a.iter()
+            .filter_map(|level| {
+                let price = Decimal::from_str(&level[0]).ok()?;
+                let quantity = Decimal::from_str(&level[1]).ok()?;
+                Some(PriceLevel { price, quantity })
+            })
+            .collect();
 
-    let timestamp_ms = ob.ts.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+    let timestamp_ms = ob
+        .ts
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
     let timestamp_utc = ms_to_datetime(timestamp_ms)?;
 
     Some(OrderBookSnapshot::new(
@@ -139,7 +139,9 @@ pub fn bybit_position_to_position(
 
     let entry_price = Decimal::from_str(&entry.avg_price).ok()?;
     let unrealized_pnl = Decimal::from_str(&entry.unrealised_pnl).ok()?;
-    let leverage = Decimal::from_str(&entry.leverage).ok().unwrap_or(Decimal::ONE);
+    let leverage = Decimal::from_str(&entry.leverage)
+        .ok()
+        .unwrap_or(Decimal::ONE);
     let liquidation_price = Decimal::from_str(&entry.liq_price)
         .ok()
         .filter(|p| !p.is_zero());
@@ -155,10 +157,7 @@ pub fn bybit_position_to_position(
 }
 
 /// Convert a Bybit REST order entry to a core `Order`.
-pub fn bybit_order_to_order(
-    entry: &BybitOrderEntry,
-    key: InstrumentKey,
-) -> Option<Order> {
+pub fn bybit_order_to_order(entry: &BybitOrderEntry, key: InstrumentKey) -> Option<Order> {
     let side = match entry.side.as_str() {
         "Buy" => OrderSide::Buy,
         "Sell" => OrderSide::Sell,
@@ -264,9 +263,15 @@ pub fn ws_order_to_order_event(
     };
 
     let size = Decimal::from_str(&update.qty).ok()?;
-    let filled_size = Decimal::from_str(&update.cum_exec_qty).ok().unwrap_or(Decimal::ZERO);
-    let price = Decimal::from_str(&update.price).ok().filter(|p| !p.is_zero());
-    let avg_fill_price = Decimal::from_str(&update.avg_price).ok().filter(|p| !p.is_zero());
+    let filled_size = Decimal::from_str(&update.cum_exec_qty)
+        .ok()
+        .unwrap_or(Decimal::ZERO);
+    let price = Decimal::from_str(&update.price)
+        .ok()
+        .filter(|p| !p.is_zero());
+    let avg_fill_price = Decimal::from_str(&update.avg_price)
+        .ok()
+        .filter(|p| !p.is_zero());
 
     let codec = BybitClientOrderIdCodec;
     let strategy_id = codec
@@ -328,8 +333,12 @@ pub fn ws_position_to_patch(
         _ => Decimal::ZERO, // closed or unknown
     };
 
-    let entry_price = Decimal::from_str(&update.entry_price).ok().unwrap_or(Decimal::ZERO);
-    let unrealized_pnl = Decimal::from_str(&update.unrealised_pnl).ok().unwrap_or(Decimal::ZERO);
+    let entry_price = Decimal::from_str(&update.entry_price)
+        .ok()
+        .unwrap_or(Decimal::ZERO);
+    let unrealized_pnl = Decimal::from_str(&update.unrealised_pnl)
+        .ok()
+        .unwrap_or(Decimal::ZERO);
 
     Some(WsPositionPatch {
         key,
